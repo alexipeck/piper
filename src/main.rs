@@ -47,15 +47,15 @@ impl KahanState {
 }
 
 const NUM_KEYS: usize = 8;
-const NUM_VALUES: usize = 10_000_000;
+const NUM_VALUES: usize = 10_000_000_0;
 
 type Msg = (u8, f32);
 
 fn main() -> Result<()> {
     println!("===========================================================");
-    println!("Example 1: 1-worker and 2-worker accumulators with timing");
+    println!("Example 1: timing sweep (1 / 2 / 4 / 8 consumers, timing only)");
     println!("===========================================================\n");
-    run_timing().context("run_timing failed")?;
+    run_timing_all().context("run_timing_all failed")?;
 
     println!("\n===========================================================");
     println!("Example 2: single consumer");
@@ -68,7 +68,12 @@ fn main() -> Result<()> {
     run_double().context("run_double failed")?;
 
     println!("\n===========================================================");
-    println!("Example 4: eight consumers");
+    println!("Example 4: four consumers");
+    println!("===========================================================\n");
+    run_four().context("run_four failed")?;
+
+    println!("\n===========================================================");
+    println!("Example 5: eight consumers");
     println!("===========================================================\n");
     run_eight().context("run_eight failed")?;
 
@@ -106,23 +111,20 @@ fn join_thread<T>(handle: JoinHandle<T>, name: &str) -> Result<T> {
     })
 }
 
-fn run_timing() -> Result<()> {
-    let cancel = Arc::new(RwLock::new(false));
-    let poll_interval = Duration::from_millis(100);
-
-    let acc1: Accumulator<Msg, WorkerOutput, ExampleError> = Accumulator::new(
+fn timed_example_accumulator(
+    num_workers: usize,
+    label: &str,
+) -> Result<Accumulator<Msg, WorkerOutput, ExampleError>> {
+    Accumulator::new(
         Config {
-            num_workers: 1,
-            poll_interval,
-            cancel: Arc::clone(&cancel),
+            num_workers,
+            poll_interval: Duration::from_millis(100),
+            cancel: Arc::new(RwLock::new(false)),
         },
         || -> std::result::Result<_, ExampleError> { Ok(WorkerState::new(NUM_KEYS)) },
         |state: &mut WorkerState, (key, value): Msg| -> std::result::Result<(), ExampleError> {
             if (key as usize) >= NUM_KEYS {
-                return Err(ExampleError::KeyOutOfRange {
-                    key,
-                    max: NUM_KEYS,
-                });
+                return Err(ExampleError::KeyOutOfRange { key, max: NUM_KEYS });
             }
             let t0 = Instant::now();
             state.started_at.get_or_insert(t0);
@@ -130,7 +132,7 @@ fn run_timing() -> Result<()> {
             state.handle_time += t0.elapsed();
             Ok(())
         },
-        |state: WorkerState| -> std::result::Result<_, ExampleError> {
+        |state: WorkerState| -> std::result::Result<WorkerOutput, ExampleError> {
             let start = state.started_at.unwrap_or_else(Instant::now);
             Ok(WorkerOutput {
                 keys: state.keys,
@@ -139,128 +141,100 @@ fn run_timing() -> Result<()> {
             })
         },
     )
-    .context("failed to build acc1")?;
-
-    let acc2: Accumulator<Msg, WorkerOutput, ExampleError> = Accumulator::new(
-        Config {
-            num_workers: 2,
-            poll_interval,
-            cancel: Arc::clone(&cancel),
-        },
-        || -> std::result::Result<_, ExampleError> { Ok(WorkerState::new(NUM_KEYS)) },
-        |state: &mut WorkerState, (key, value): Msg| -> std::result::Result<(), ExampleError> {
-            if (key as usize) >= NUM_KEYS {
-                return Err(ExampleError::KeyOutOfRange {
-                    key,
-                    max: NUM_KEYS,
-                });
-            }
-            let t0 = Instant::now();
-            state.started_at.get_or_insert(t0);
-            state.keys[key as usize].add(value as f64);
-            state.handle_time += t0.elapsed();
-            Ok(())
-        },
-        |state: WorkerState| -> std::result::Result<_, ExampleError> {
-            let start = state.started_at.unwrap_or_else(Instant::now);
-            Ok(WorkerOutput {
-                keys: state.keys,
-                handle_time: state.handle_time,
-                wall_time: start.elapsed(),
-            })
-        },
-    )
-    .context("failed to build acc2")?;
-
-    let s1 = acc1.sender();
-    let s2 = acc2.sender();
-
-    let producer = thread::spawn(move || -> Result<()> {
-        let mut rng = rand::rng();
-        for _ in 0..NUM_VALUES {
-            let key: u8 = rng.random_range(0..NUM_KEYS as u8);
-            let value: f32 = rng.random::<f32>();
-            s1.send((key, value)).context("acc1 channel send failed")?;
-            s2.send((key, value)).context("acc2 channel send failed")?;
-        }
-        thread::yield_now();
-        Ok(())
-    });
-
-    join_thread(producer, "producer")??;
-
-    let acc1_handle = thread::spawn(move || -> Result<(Vec<WorkerOutput>, Duration)> {
-        let t0 = Instant::now();
-        let r = acc1.join().context("acc1 join failed")?;
-        Ok((r, t0.elapsed()))
-    });
-    let acc2_handle = thread::spawn(move || -> Result<(Vec<WorkerOutput>, Duration)> {
-        let t0 = Instant::now();
-        let r = acc2.join().context("acc2 join failed")?;
-        Ok((r, t0.elapsed()))
-    });
-
-    let (results1, drain1) = join_thread(acc1_handle, "acc1-joiner")??;
-    let (results2, drain2) = join_thread(acc2_handle, "acc2-joiner")??;
-
-    let combined1: Vec<KahanState> = results1[0].keys.clone();
-    let combined2: Vec<KahanState> = (0..NUM_KEYS)
-        .map(|k| KahanState::merge(&results2[0].keys[k], &results2[1].keys[k]))
-        .collect();
-
-    println!(
-        "Kahan compensated summation over {NUM_VALUES} random f32 values across {NUM_KEYS} keys\n"
-    );
-
-    print_per_thread("1-worker accumulator", &results1);
-    print_combined("1-worker combined", &combined1);
-    print_timing_summary("1-worker", &results1, drain1);
-
-    print_per_thread("2-worker accumulator", &results2);
-    print_combined("2-worker combined", &combined2);
-    print_timing_summary("2-worker", &results2, drain2);
-
-    println!("comparison of combined means:");
-    println!(
-        "  {:<5} {:>24} {:>24} {:>14}",
-        "key", "mean (1 worker)", "mean (2 workers)", "abs diff"
-    );
-    for k in 0..NUM_KEYS {
-        let m1 = combined1[k].mean();
-        let m2 = combined2[k].mean();
-        println!(
-            "  {:<5} {:>24.17} {:>24.17} {:>14.3e}",
-            k,
-            m1,
-            m2,
-            (m1 - m2).abs()
-        );
-    }
-
-    Ok(())
+    .context(format!("failed to build accumulator ({label})"))
 }
 
-fn run_single() -> Result<()> {
-    type Storage = Vec<KahanState>;
+type Storage = Vec<KahanState>;
 
-    let acc: Accumulator<Msg, Storage, ExampleError> = Accumulator::new(
+fn clean_example_accumulator(
+    num_workers: usize,
+    label: &str,
+) -> Result<Accumulator<Msg, Storage, ExampleError>> {
+    Accumulator::new(
         Config {
-            num_workers: 1,
+            num_workers,
             poll_interval: Duration::from_millis(100),
             cancel: Arc::new(RwLock::new(false)),
         },
         || -> std::result::Result<_, ExampleError> { Ok(vec![KahanState::default(); NUM_KEYS]) },
         |s: &mut Storage, (k, v): Msg| -> std::result::Result<(), ExampleError> {
             if (k as usize) >= NUM_KEYS {
-                return Err(ExampleError::KeyOutOfRange { key: k, max: NUM_KEYS });
+                return Err(ExampleError::KeyOutOfRange {
+                    key: k,
+                    max: NUM_KEYS,
+                });
             }
             s[k as usize].add(v as f64);
             Ok(())
         },
         |s: Storage| -> std::result::Result<_, ExampleError> { Ok(s) },
     )
-    .context("failed to build accumulator")?;
+    .context(format!("failed to build clean accumulator ({label})"))
+}
 
+fn merge_all_keys(results: &[Vec<KahanState>]) -> Vec<KahanState> {
+    assert!(!results.is_empty());
+    (0..NUM_KEYS)
+        .map(|k| {
+            results
+                .iter()
+                .skip(1)
+                .fold(results[0][k].clone(), |acc, w| {
+                    KahanState::merge(&acc, &w[k])
+                })
+        })
+        .collect()
+}
+
+fn run_timing_all() -> Result<()> {
+    for n in [1usize, 2, 4, 8] {
+        let label = if n == 1 {
+            String::from("1 consumer")
+        } else {
+            format!("{n} consumers")
+        };
+
+        let acc = timed_example_accumulator(n, &label)?;
+
+        let sender = acc.sender();
+        let producer_name = format!("producer-{n}");
+        let producer = thread::Builder::new()
+            .name(producer_name.clone())
+            .spawn(move || -> Result<()> {
+                let mut rng = rand::rng();
+                for _ in 0..NUM_VALUES {
+                    let key: u8 = rng.random_range(0..NUM_KEYS as u8);
+                    let value: f32 = rng.random::<f32>();
+                    sender.send((key, value)).context("channel send failed")?;
+                }
+                thread::yield_now();
+                Ok(())
+            })
+            .with_context(|| format!("spawn `{}`", producer_name.clone()))?;
+
+        join_thread(producer, &producer_name)??;
+
+        let joiner_name = format!("acc-joiner-{n}");
+        let acc_join = thread::Builder::new()
+            .name(joiner_name.clone())
+            .spawn(move || -> Result<(Vec<WorkerOutput>, Duration)> {
+                let t0 = Instant::now();
+                let r = acc.join().context("accumulator join failed")?;
+                Ok((r, t0.elapsed()))
+            })
+            .with_context(|| format!("spawn `{}`", joiner_name.clone()))?;
+
+        let (results, drain) = join_thread(acc_join, &joiner_name)??;
+        print_timing_summary(&label, &results, drain);
+        println!();
+    }
+    Ok(())
+}
+
+fn run_single() -> Result<()> {
+    const N: usize = 1;
+
+    let acc = clean_example_accumulator(N, "single")?;
     let sender = acc.sender();
     let producer = thread::spawn(move || -> Result<()> {
         let mut rng = rand::rng();
@@ -275,7 +249,7 @@ fn run_single() -> Result<()> {
 
     join_thread(producer, "producer")??;
     let results = acc.join().context("accumulator join failed")?;
-    let combined = &results[0];
+    let combined = merge_all_keys(&results);
 
     println!("{NUM_VALUES} f32 values across {NUM_KEYS} keys, 1 consumer");
     for (k, st) in combined.iter().enumerate() {
@@ -285,26 +259,9 @@ fn run_single() -> Result<()> {
 }
 
 fn run_double() -> Result<()> {
-    const NUM_WORKERS: usize = 2;
-    type Storage = Vec<KahanState>;
+    const N: usize = 2;
 
-    let acc: Accumulator<Msg, Storage, ExampleError> = Accumulator::new(
-        Config {
-            num_workers: NUM_WORKERS,
-            poll_interval: Duration::from_millis(100),
-            cancel: Arc::new(RwLock::new(false)),
-        },
-        || -> std::result::Result<_, ExampleError> { Ok(vec![KahanState::default(); NUM_KEYS]) },
-        |s: &mut Storage, (k, v): Msg| -> std::result::Result<(), ExampleError> {
-            if (k as usize) >= NUM_KEYS {
-                return Err(ExampleError::KeyOutOfRange { key: k, max: NUM_KEYS });
-            }
-            s[k as usize].add(v as f64);
-            Ok(())
-        },
-        |s: Storage| -> std::result::Result<_, ExampleError> { Ok(s) },
-    )
-    .context("failed to build accumulator")?;
+    let acc = clean_example_accumulator(N, "double")?;
 
     let sender = acc.sender();
     let producer = thread::spawn(move || -> Result<()> {
@@ -321,11 +278,38 @@ fn run_double() -> Result<()> {
     join_thread(producer, "producer")??;
     let results = acc.join().context("accumulator join failed")?;
 
-    let combined: Vec<KahanState> = (0..NUM_KEYS)
-        .map(|k| KahanState::merge(&results[0][k], &results[1][k]))
-        .collect();
+    let combined = merge_all_keys(&results);
 
-    println!("{NUM_VALUES} f32 values across {NUM_KEYS} keys, {NUM_WORKERS} consumers");
+    println!("{NUM_VALUES} f32 values across {NUM_KEYS} keys, {N} consumers");
+    for (k, st) in combined.iter().enumerate() {
+        println!("  key {k}: count={:>8}, mean={:.17}", st.count, st.mean());
+    }
+    Ok(())
+}
+
+fn run_four() -> Result<()> {
+    const N: usize = 4;
+
+    let acc = clean_example_accumulator(N, "four")?;
+
+    let sender = acc.sender();
+    let producer = thread::spawn(move || -> Result<()> {
+        let mut rng = rand::rng();
+        for _ in 0..NUM_VALUES {
+            let key: u8 = rng.random_range(0..NUM_KEYS as u8);
+            let value: f32 = rng.random::<f32>();
+            sender.send((key, value)).context("channel send failed")?;
+        }
+        thread::yield_now();
+        Ok(())
+    });
+
+    join_thread(producer, "producer")??;
+    let results = acc.join().context("accumulator join failed")?;
+
+    let combined = merge_all_keys(&results);
+
+    println!("{NUM_VALUES} f32 values across {NUM_KEYS} keys, {N} consumers");
     for (k, st) in combined.iter().enumerate() {
         println!("  key {k}: count={:>8}, mean={:.17}", st.count, st.mean());
     }
@@ -333,26 +317,9 @@ fn run_double() -> Result<()> {
 }
 
 fn run_eight() -> Result<()> {
-    const NUM_WORKERS: usize = 8;
-    type Storage = Vec<KahanState>;
+    const N: usize = 8;
 
-    let acc: Accumulator<Msg, Storage, ExampleError> = Accumulator::new(
-        Config {
-            num_workers: NUM_WORKERS,
-            poll_interval: Duration::from_millis(100),
-            cancel: Arc::new(RwLock::new(false)),
-        },
-        || -> std::result::Result<_, ExampleError> { Ok(vec![KahanState::default(); NUM_KEYS]) },
-        |s: &mut Storage, (k, v): Msg| -> std::result::Result<(), ExampleError> {
-            if (k as usize) >= NUM_KEYS {
-                return Err(ExampleError::KeyOutOfRange { key: k, max: NUM_KEYS });
-            }
-            s[k as usize].add(v as f64);
-            Ok(())
-        },
-        |s: Storage| -> std::result::Result<_, ExampleError> { Ok(s) },
-    )
-    .context("failed to build accumulator")?;
+    let acc = clean_example_accumulator(N, "eight")?;
 
     let sender = acc.sender();
     let producer = thread::spawn(move || -> Result<()> {
@@ -369,57 +336,13 @@ fn run_eight() -> Result<()> {
     join_thread(producer, "producer")??;
     let results = acc.join().context("accumulator join failed")?;
 
-    let combined: Vec<KahanState> = (0..NUM_KEYS)
-        .map(|k| {
-            results
-                .iter()
-                .skip(1)
-                .fold(results[0][k].clone(), |acc, w| {
-                    KahanState::merge(&acc, &w[k])
-                })
-        })
-        .collect();
+    let combined = merge_all_keys(&results);
 
-    println!("{NUM_VALUES} f32 values across {NUM_KEYS} keys, {NUM_WORKERS} consumers");
+    println!("{NUM_VALUES} f32 values across {NUM_KEYS} keys, {N} consumers");
     for (k, st) in combined.iter().enumerate() {
         println!("  key {k}: count={:>8}, mean={:.17}", st.count, st.mean());
     }
     Ok(())
-}
-
-fn print_per_thread(label: &str, results: &[WorkerOutput]) {
-    println!("{label} per-thread state:");
-    for (i, w) in results.iter().enumerate() {
-        println!(
-            "  worker {i}: handle_time={:?}, wall_time={:?}",
-            w.handle_time, w.wall_time
-        );
-        print_state_table(&w.keys, "    ");
-    }
-    println!();
-}
-
-fn print_combined(label: &str, combined: &[KahanState]) {
-    println!("{label} state:");
-    print_state_table(combined, "  ");
-    println!();
-}
-
-fn print_state_table(state: &[KahanState], indent: &str) {
-    println!(
-        "{indent}{:<5} {:>10} {:>24} {:>14} {:>24}",
-        "key", "count", "sum", "compensation", "mean"
-    );
-    for (k, st) in state.iter().enumerate() {
-        println!(
-            "{indent}{:<5} {:>10} {:>24.17} {:>14.3e} {:>24.17}",
-            k,
-            st.count,
-            st.sum,
-            st.compensation,
-            st.mean()
-        );
-    }
 }
 
 fn print_timing_summary(label: &str, results: &[WorkerOutput], drain: Duration) {
