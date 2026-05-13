@@ -96,11 +96,10 @@ where
                 .name(name.clone())
                 .spawn(
                     move || -> std::result::Result<Output, AccumulatorError<UserErr>> {
-                        let mut storage =
-                            init().map_err(|error| AccumulatorError::UserInit {
-                                worker: thread_name.clone(),
-                                error,
-                            })?;
+                        let mut storage = init().map_err(|error| AccumulatorError::UserInit {
+                            worker: thread_name.clone(),
+                            error,
+                        })?;
                         loop {
                             if *cancel.read() {
                                 break;
