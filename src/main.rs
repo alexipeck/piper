@@ -81,27 +81,32 @@ fn main() -> Result<()> {
     println!("===========================================================\n");
     run_timing_all(max_batch_size, Arc::clone(&samples)).context("run_timing_all failed")?;
 
+    println!("\n===========================================================");
+    println!("Example 2: two producer threads, four consumers");
+    println!("===========================================================\n");
+    run_two_producers(max_batch_size, Arc::clone(&samples)).context("run_two_producers failed")?;
+
     if std::env::var_os("ACCUMULATOR_TIMING_ONLY").is_some() {
         return Ok(());
     }
 
     println!("\n===========================================================");
-    println!("Example 2: single consumer");
+    println!("Example 3: single consumer");
     println!("===========================================================\n");
     run_single(max_batch_size, Arc::clone(&samples)).context("run_single failed")?;
 
     println!("\n===========================================================");
-    println!("Example 3: double consumer");
+    println!("Example 4: double consumer");
     println!("===========================================================\n");
     run_double(max_batch_size, Arc::clone(&samples)).context("run_double failed")?;
 
     println!("\n===========================================================");
-    println!("Example 4: four consumers");
+    println!("Example 5: four consumers");
     println!("===========================================================\n");
     run_four(max_batch_size, Arc::clone(&samples)).context("run_four failed")?;
 
     println!("\n===========================================================");
-    println!("Example 5: eight consumers");
+    println!("Example 6: eight consumers");
     println!("===========================================================\n");
     run_eight(max_batch_size, Arc::clone(&samples)).context("run_eight failed")?;
 
@@ -132,15 +137,32 @@ struct WorkerOutput {
 
 #[derive(Default)]
 struct ProducerStats {
+    values: u64,
+    batches: u64,
     elapsed: Duration,
     buffer_wait: Duration,
     buffer_fill: Duration,
     channel_send: Duration,
 }
 
+struct ProducerReport {
+    name: &'static str,
+    stats: ProducerStats,
+}
+
 struct TimingRun {
     results: Vec<WorkerOutput>,
     producer: ProducerStats,
+    producer_join: Duration,
+    drain: Duration,
+    total: Duration,
+    max_batch_size: usize,
+    buffer_pool_size: usize,
+}
+
+struct MultiProducerTimingRun {
+    results: Vec<WorkerOutput>,
+    producers: Vec<ProducerReport>,
     producer_join: Duration,
     drain: Duration,
     total: Duration,
@@ -234,11 +256,15 @@ fn send_sample_batches(
     samples: Arc<Vec<Sample>>,
     buffer_receiver: BufferReceiver,
     max_batch_size: usize,
+    start: usize,
+    end: usize,
 ) -> Result<ProducerStats> {
     let send_started = Instant::now();
     let mut stats = ProducerStats::default();
+    let start = start.min(samples.len());
+    let end = end.min(samples.len()).max(start);
 
-    for chunk in samples.chunks(max_batch_size) {
+    for chunk in samples[start..end].chunks(max_batch_size) {
         let wait_started = Instant::now();
         let mut batch = buffer_receiver
             .recv()
@@ -248,6 +274,8 @@ fn send_sample_batches(
         let fill_started = Instant::now();
         batch.clear();
         batch.extend_from_slice(chunk);
+        stats.values += chunk.len() as u64;
+        stats.batches += 1;
         stats.buffer_fill += fill_started.elapsed();
 
         let send_one_started = Instant::now();
@@ -434,7 +462,8 @@ fn run_timing_all(max_batch_size: usize, samples: Arc<Vec<Sample>>) -> Result<()
         let producer = thread::Builder::new()
             .name(producer_name.clone())
             .spawn(move || -> Result<ProducerStats> {
-                send_sample_batches(sender, samples, buffer_receiver, max_batch_size)
+                let end = samples.len();
+                send_sample_batches(sender, samples, buffer_receiver, max_batch_size, 0, end)
             })
             .with_context(|| format!("spawn `{}`", producer_name.clone()))?;
 
@@ -461,6 +490,83 @@ fn run_timing_all(max_batch_size: usize, samples: Arc<Vec<Sample>>) -> Result<()
     Ok(())
 }
 
+fn run_two_producers(max_batch_size: usize, samples: Arc<Vec<Sample>>) -> Result<()> {
+    const NUM_CONSUMERS: usize = 4;
+
+    let label = "2 producers / 4 consumers";
+    let total_started = Instant::now();
+    let buffer_pool_size = configured_buffer_pool_size(NUM_CONSUMERS);
+    let (buffer_return, buffer_receiver) = create_buffer_pool(max_batch_size, buffer_pool_size)?;
+    let acc = timed_example_accumulator(NUM_CONSUMERS, label, buffer_return)?;
+    let split = samples.len() / 2;
+
+    let left_sender = acc.sender();
+    let left_samples = Arc::clone(&samples);
+    let left_buffers = buffer_receiver.clone();
+    let left_name = "producer-left";
+    let left = thread::Builder::new()
+        .name(left_name.to_string())
+        .spawn(move || -> Result<ProducerStats> {
+            send_sample_batches(
+                left_sender,
+                left_samples,
+                left_buffers,
+                max_batch_size,
+                0,
+                split,
+            )
+        })
+        .with_context(|| format!("spawn `{left_name}`"))?;
+
+    let right_sender = acc.sender();
+    let right_samples = Arc::clone(&samples);
+    let right_name = "producer-right";
+    let right_end = samples.len();
+    let right = thread::Builder::new()
+        .name(right_name.to_string())
+        .spawn(move || -> Result<ProducerStats> {
+            send_sample_batches(
+                right_sender,
+                right_samples,
+                buffer_receiver,
+                max_batch_size,
+                split,
+                right_end,
+            )
+        })
+        .with_context(|| format!("spawn `{right_name}`"))?;
+
+    let producer_join_started = Instant::now();
+    let left_stats = join_thread(left, left_name)??;
+    let right_stats = join_thread(right, right_name)??;
+    let producer_join = producer_join_started.elapsed();
+
+    let drain_started = Instant::now();
+    let results = acc.join().context("accumulator join failed")?;
+    let drain = drain_started.elapsed();
+
+    let timing = MultiProducerTimingRun {
+        results,
+        producers: vec![
+            ProducerReport {
+                name: left_name,
+                stats: left_stats,
+            },
+            ProducerReport {
+                name: right_name,
+                stats: right_stats,
+            },
+        ],
+        producer_join,
+        drain,
+        total: total_started.elapsed(),
+        max_batch_size,
+        buffer_pool_size,
+    };
+    print_multi_producer_summary(label, &timing);
+    Ok(())
+}
+
 fn run_single(max_batch_size: usize, samples: Arc<Vec<Sample>>) -> Result<()> {
     const N: usize = 1;
 
@@ -469,7 +575,8 @@ fn run_single(max_batch_size: usize, samples: Arc<Vec<Sample>>) -> Result<()> {
     let acc = clean_example_accumulator(N, "single", buffer_return)?;
     let sender = acc.sender();
     let producer = thread::spawn(move || -> Result<()> {
-        send_sample_batches(sender, samples, buffer_receiver, max_batch_size)?;
+        let end = samples.len();
+        send_sample_batches(sender, samples, buffer_receiver, max_batch_size, 0, end)?;
         Ok(())
     });
 
@@ -493,7 +600,8 @@ fn run_double(max_batch_size: usize, samples: Arc<Vec<Sample>>) -> Result<()> {
 
     let sender = acc.sender();
     let producer = thread::spawn(move || -> Result<()> {
-        send_sample_batches(sender, samples, buffer_receiver, max_batch_size)?;
+        let end = samples.len();
+        send_sample_batches(sender, samples, buffer_receiver, max_batch_size, 0, end)?;
         Ok(())
     });
 
@@ -518,7 +626,8 @@ fn run_four(max_batch_size: usize, samples: Arc<Vec<Sample>>) -> Result<()> {
 
     let sender = acc.sender();
     let producer = thread::spawn(move || -> Result<()> {
-        send_sample_batches(sender, samples, buffer_receiver, max_batch_size)?;
+        let end = samples.len();
+        send_sample_batches(sender, samples, buffer_receiver, max_batch_size, 0, end)?;
         Ok(())
     });
 
@@ -543,7 +652,8 @@ fn run_eight(max_batch_size: usize, samples: Arc<Vec<Sample>>) -> Result<()> {
 
     let sender = acc.sender();
     let producer = thread::spawn(move || -> Result<()> {
-        send_sample_batches(sender, samples, buffer_receiver, max_batch_size)?;
+        let end = samples.len();
+        send_sample_batches(sender, samples, buffer_receiver, max_batch_size, 0, end)?;
         Ok(())
     });
 
@@ -607,6 +717,8 @@ fn print_timing_summary(label: &str, timing: &TimingRun) {
   buffer pool size   : {}
   total elapsed      : {:?} ({:.2} M values/s)
   producer send      : {:?} ({:.2} M values/s)
+  producer values    : {}
+  producer batches   : {}
   producer wait      : {:?}
   producer fill      : {:?}
   channel send       : {:?}
@@ -625,9 +737,97 @@ fn print_timing_summary(label: &str, timing: &TimingRun) {
         million_msgs_per_sec(total_count, timing.total),
         timing.producer.elapsed,
         million_msgs_per_sec(total_count, timing.producer.elapsed),
+        timing.producer.values,
+        timing.producer.batches,
         timing.producer.buffer_wait,
         timing.producer.buffer_fill,
         timing.producer.channel_send,
+        timing.producer_join,
+        timing.drain,
+        million_msgs_per_sec(total_count, timing.drain),
+        worker_wall_sum,
+        min_wall,
+        max_wall,
+        duration_per_msg(worker_wall_sum, total_count),
+        duration_per_msg(timing.total, total_count),
+        worker_counts,
+        worker_batches,
+    );
+}
+
+fn print_multi_producer_summary(label: &str, timing: &MultiProducerTimingRun) {
+    let results = &timing.results;
+    let worker_wall_sum: Duration = results.iter().map(|w| w.wall_time).sum();
+    let min_wall: Duration = results
+        .iter()
+        .map(|w| w.wall_time)
+        .min()
+        .unwrap_or_default();
+    let max_wall: Duration = results
+        .iter()
+        .map(|w| w.wall_time)
+        .max()
+        .unwrap_or_default();
+    let worker_counts: Vec<u64> = results.iter().map(worker_message_count).collect();
+    let total_count: u64 = worker_counts.iter().sum();
+    let batch_count = channel_batch_count(total_count, timing.max_batch_size);
+    let worker_batches: Vec<u64> = results.iter().map(|w| w.batches).collect();
+    let min_count = worker_counts.iter().copied().min().unwrap_or_default();
+    let max_count = worker_counts.iter().copied().max().unwrap_or_default();
+    let count_spread = max_count.saturating_sub(min_count);
+
+    let producer_values: u64 = timing.producers.iter().map(|p| p.stats.values).sum();
+    let producer_batches: u64 = timing.producers.iter().map(|p| p.stats.batches).sum();
+    let producer_wall = timing
+        .producers
+        .iter()
+        .map(|p| p.stats.elapsed)
+        .max()
+        .unwrap_or_default();
+    let producer_wait: Duration = timing.producers.iter().map(|p| p.stats.buffer_wait).sum();
+    let producer_fill: Duration = timing.producers.iter().map(|p| p.stats.buffer_fill).sum();
+    let producer_channel_send: Duration =
+        timing.producers.iter().map(|p| p.stats.channel_send).sum();
+    let producer_details = timing
+        .producers
+        .iter()
+        .map(|p| {
+            format!(
+                "{}: values={}, batches={}, elapsed={:?}",
+                p.name, p.stats.values, p.stats.batches, p.stats.elapsed
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    println!(
+        "{label} timing summary:
+  values processed   : {total_count}
+  producer values    : {producer_values}
+  channel batches    : {batch_count} (max batch size: {})
+  producer batches   : {producer_batches}
+  buffer pool size   : {}
+  total elapsed      : {:?} ({:.2} M values/s)
+  producer wall      : {:?} ({:.2} M values/s)
+  producer wait sum  : {producer_wait:?}
+  producer fill sum  : {producer_fill:?}
+  channel send sum   : {producer_channel_send:?}
+  producer joined    : {:?}
+  post-feed drain    : {:?} ({:.2} M values/s)
+  producer details   : {producer_details}
+  worker wall sum    : {:?}
+  worker wall range  : {:?} .. {:?}
+  worker avg / value : {:?}
+  end-to-end / value : {:?}
+  worker values      : {:?} (min={min_count}, max={max_count}, spread={count_spread})
+  worker batches     : {:?}
+",
+        timing.max_batch_size,
+        timing.buffer_pool_size,
+        timing.total,
+        million_msgs_per_sec(total_count, timing.total),
+        producer_wall,
+        million_msgs_per_sec(producer_values, producer_wall),
         timing.producer_join,
         timing.drain,
         million_msgs_per_sec(total_count, timing.drain),
