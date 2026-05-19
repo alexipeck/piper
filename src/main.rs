@@ -1,8 +1,8 @@
-use accumulator::{Accumulator, Config, panic_payload_to_string};
 use anyhow::{Context, Result, anyhow};
-use parking_lot::RwLock;
+use piper::{Pipe, PipeConfig, panic_payload_to_string};
 use rand::RngExt;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -53,8 +53,8 @@ const DEFAULT_BUFFER_POOL_MULTIPLIER: usize = 2;
 
 type Sample = (u8, f32);
 type Msg = Vec<Sample>;
-type BufferSender = accumulator::kanal::Sender<Msg>;
-type BufferReceiver = accumulator::kanal::Receiver<Msg>;
+type BufferSender = piper::kanal::Sender<Msg>;
+type BufferReceiver = piper::kanal::Receiver<Msg>;
 
 fn main() -> Result<()> {
     let max_batch_size = configured_max_batch_size();
@@ -237,7 +237,7 @@ fn create_buffer_pool(
     max_batch_size: usize,
     buffer_pool_size: usize,
 ) -> Result<(BufferSender, BufferReceiver)> {
-    let (sender, receiver) = accumulator::kanal::unbounded::<Msg>();
+    let (sender, receiver) = piper::kanal::unbounded::<Msg>();
     for _ in 0..buffer_pool_size {
         sender
             .send(Vec::with_capacity(max_batch_size))
@@ -252,7 +252,7 @@ fn return_buffer(sender: &BufferSender, mut buffer: Msg) {
 }
 
 fn send_sample_batches(
-    sender: accumulator::kanal::Sender<Msg>,
+    sender: piper::kanal::Sender<Msg>,
     samples: Arc<Vec<Sample>>,
     buffer_receiver: BufferReceiver,
     max_batch_size: usize,
@@ -292,12 +292,12 @@ fn timed_example_accumulator(
     num_workers: usize,
     label: &str,
     buffer_return: BufferSender,
-) -> Result<Accumulator<Msg, WorkerOutput, ExampleError>> {
-    Accumulator::new(
-        Config {
+) -> Result<Pipe<Msg, WorkerOutput, ExampleError>> {
+    Pipe::new(
+        PipeConfig {
             num_workers,
             poll_interval: Duration::from_millis(100),
-            cancel: Arc::new(RwLock::new(false)),
+            cancel: Arc::new(AtomicBool::new(false)),
         },
         || -> std::result::Result<_, ExampleError> { Ok(WorkerState::new(NUM_KEYS)) },
         move |state: &mut WorkerState, batch: Msg| -> std::result::Result<(), ExampleError> {
@@ -333,12 +333,12 @@ fn clean_example_accumulator(
     num_workers: usize,
     label: &str,
     buffer_return: BufferSender,
-) -> Result<Accumulator<Msg, Storage, ExampleError>> {
-    Accumulator::new(
-        Config {
+) -> Result<Pipe<Msg, Storage, ExampleError>> {
+    Pipe::new(
+        PipeConfig {
             num_workers,
             poll_interval: Duration::from_millis(100),
-            cancel: Arc::new(RwLock::new(false)),
+            cancel: Arc::new(AtomicBool::new(false)),
         },
         || -> std::result::Result<_, ExampleError> { Ok(vec![KahanState::default(); NUM_KEYS]) },
         move |s: &mut Storage, batch: Msg| -> std::result::Result<(), ExampleError> {

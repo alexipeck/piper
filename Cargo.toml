@@ -1,5 +1,8 @@
+[workspace]
+members = ["piper-macros"]
+
 [package]
-name = "accumulator"
+name = "piper"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,5 +10,9 @@ edition = "2024"
 anyhow = "1.0.102"
 kanal = "0.1.1"
 parking_lot = "0.12.5"
+piper-macros = { path = "piper-macros" }
 rand = "0.10.1"
 thiserror = "2.0.18"
+
+[dev-dependencies]
+trybuild = "1.0.114"
