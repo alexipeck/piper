@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Piper CSV Viewer</title>
+  <!-- Local: use file picker. Served: python -m http.server from repo root, then
+       piper-csv-viewer.html (example CSV embedded). Optional: ?csv=other.csv when served -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      font-size: 13px;
+      background: #14161a;
+      color: #d8dce3;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px 14px;
+      padding: 10px 14px;
+      border-bottom: 1px solid #2a2f38;
+      background: #1a1d23;
+      flex-shrink: 0;
+    }
+    .toolbar label { color: #8b93a1; }
+    .toolbar input[type="file"] { max-width: 220px; }
+    .toolbar input[type="range"] { width: 140px; }
+    .toolbar button {
+      background: #2a3140;
+      border: 1px solid #3d4656;
+      color: #d8dce3;
+      padding: 4px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .toolbar button:hover { background: #354052; }
+    .drop-hint {
+      color: #6b7280;
+      font-size: 12px;
+    }
+    .drop-hint.drag-over { color: #7eb8ff; }
+    .row-label { min-width: 72px; font-variant-numeric: tabular-nums; }
+    .layout {
+      display: flex;
+      flex: 1;
+      min-height: 0;
+    }
+    .sidebar {
+      width: 240px;
+      flex-shrink: 0;
+      border-right: 1px solid #2a2f38;
+      display: flex;
+      flex-direction: column;
+      background: #181b21;
+    }
+    .sidebar-head {
+      padding: 10px;
+      border-bottom: 1px solid #2a2f38;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .sidebar-head input {
+      width: 100%;
+      padding: 6px 8px;
+      border: 1px solid #3d4656;
+      border-radius: 4px;
+      background: #14161a;
+      color: #d8dce3;
+    }
+    .sidebar-actions { display: flex; gap: 6px; }
+    .sidebar-actions button {
+      flex: 1;
+      font-size: 11px;
+      padding: 4px 6px;
+      background: #2a3140;
+      border: 1px solid #3d4656;
+      color: #d8dce3;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .sidebar-actions button:hover { background: #354052; }
+    .column-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 6px 0;
+    }
+    .column-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 10px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .column-item:hover { background: #22262e; }
+    .column-item.hidden-filter { display: none; }
+    .column-item input { margin: 0; cursor: pointer; }
+    .column-item span {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 12px;
+    }
+    .main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+    .chart-section {
+      flex: 3;
+      display: flex;
+      flex-direction: column;
+      min-height: 200px;
+      border-bottom: 1px solid #2a2f38;
+      background: #14161a;
+    }
+    .chart-head {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 6px 14px;
+      flex-shrink: 0;
+      color: #8b93a1;
+      font-size: 12px;
+    }
+    .chart-head label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+    .chart-wrap {
+      flex: 1;
+      min-height: 0;
+      position: relative;
+      padding: 0 8px 4px;
+    }
+    .chart-wrap .uplot {
+      font-family: inherit;
+    }
+    .chart-wrap .u-legend { display: none; }
+    #chartHost { width: 100%; height: 100%; }
+    .chart-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 12px;
+      padding: 4px 14px 8px;
+      flex-shrink: 0;
+      max-height: 56px;
+      overflow-y: auto;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      color: #8b93a1;
+    }
+    .legend-swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+      flex-shrink: 0;
+    }
+    .table-section {
+      flex: 2;
+      display: flex;
+      flex-direction: column;
+      min-height: 140px;
+    }
+    .table-wrap {
+      flex: 1;
+      overflow: auto;
+      min-height: 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: max-content;
+      min-width: 100%;
+    }
+    thead th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: #1f2430;
+      border-bottom: 2px solid #3d4656;
+      padding: 6px 10px;
+      text-align: left;
+      font-weight: 600;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+    tbody td {
+      padding: 4px 10px;
+      border-bottom: 1px solid #232830;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+    tbody tr { cursor: pointer; }
+    tbody tr:hover { background: #1e232c; }
+    tbody tr.selected { background: #253045; }
+    tbody tr.selected td { border-bottom-color: #354052; }
+    .detail {
+      flex-shrink: 0;
+      max-height: 120px;
+      overflow: auto;
+      border-top: 1px solid #2a2f38;
+      background: #181b21;
+      padding: 10px 14px;
+    }
+    .detail h3 {
+      margin: 0 0 8px;
+      font-size: 12px;
+      font-weight: 600;
+      color: #8b93a1;
+    }
+    .detail-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 4px 16px;
+    }
+    .detail-pair {
+      display: flex;
+      gap: 8px;
+      font-size: 12px;
+      min-width: 0;
+    }
+    .detail-pair dt {
+      margin: 0;
+      color: #7eb8ff;
+      flex-shrink: 0;
+      max-width: 50%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .detail-pair dd {
+      margin: 0;
+      font-variant-numeric: tabular-nums;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .empty-state {
+      padding: 24px;
+      color: #6b7280;
+      text-align: center;
+    }
+    .status { color: #8b93a1; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="toolbar" id="toolbar">
+    <input type="file" id="fileInput" accept=".csv,text/csv">
+    <span class="drop-hint" id="dropHint">Drop CSV or pick file to replace embedded example</span>
+    <label><input type="checkbox" id="logScale"> Log Y</label>
+    <label><input type="checkbox" id="showAllRows" checked> Show all rows</label>
+    <button type="button" id="prevRow" disabled>&larr;</button>
+    <input type="range" id="rowSlider" min="0" max="0" value="0" disabled>
+    <button type="button" id="nextRow" disabled>&rarr;</button>
+    <span class="row-label" id="rowLabel">—</span>
+    <span class="status" id="status"></span>
+  </div>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <input type="search" id="columnSearch" placeholder="Filter columns…" disabled>
+        <div class="sidebar-actions">
+          <button type="button" id="selectAll" disabled>All</button>
+          <button type="button" id="selectNone" disabled>None</button>
+        </div>
+      </div>
+      <div class="column-list" id="columnList"></div>
+    </aside>
+    <div class="main">
+      <section class="chart-section" id="chartSection">
+        <div class="chart-head">
+          <span>Graph — X: elapsed_ms · check columns in sidebar to plot</span>
+        </div>
+        <div class="chart-wrap" id="chartWrap">
+          <p class="empty-state" id="chartEmpty">Load CSV and select numeric columns to graph.</p>
+          <div id="chartHost"></div>
+        </div>
+        <div class="chart-legend" id="chartLegend"></div>
+      </section>
+      <div class="table-section">
+        <div class="table-wrap" id="tableWrap" tabindex="0">
+          <p class="empty-state" id="emptyState">Load a Piper CSV to begin.</p>
+          <table id="dataTable" hidden>
+            <thead id="tableHead"></thead>
+            <tbody id="tableBody"></tbody>
+          </table>
+        </div>
+        <section class="detail" id="detailPanel" hidden>
+          <h3 id="detailTitle">Row detail</h3>
+          <dl class="detail-grid" id="detailGrid"></dl>
+        </section>
+      </div>
+    </div>
+  </div>
+  <script type="text/csv" id="embeddedCsv">
+elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_threads,anchor_index,anchor_name,anchor_active_threads,anchor_max_threads,anchor_probe_state,anchor_effective_probe_interval_ms,anchor_last_probe_outcome,link0_len,link0_state,link1_len,link1_state,link2_len,link2_state,link3_len,link3_state,link4_len,link4_state,stage0_name,stage0_active_threads,stage0_processed_count,stage0_busy_ratio,stage0_busy_ceiling,stage0_effective_add_dwell_ms,stage0_effective_remove_dwell_ms,stage0_scaling_state,stage0_is_anchor,stage1_name,stage1_active_threads,stage1_processed_count,stage1_busy_ratio,stage1_busy_ceiling,stage1_effective_add_dwell_ms,stage1_effective_remove_dwell_ms,stage1_scaling_state,stage1_is_anchor,stage2_name,stage2_active_threads,stage2_processed_count,stage2_busy_ratio,stage2_busy_ceiling,stage2_effective_add_dwell_ms,stage2_effective_remove_dwell_ms,stage2_scaling_state,stage2_is_anchor,stage3_name,stage3_active_threads,stage3_processed_count,stage3_busy_ratio,stage3_busy_ceiling,stage3_effective_add_dwell_ms,stage3_effective_remove_dwell_ms,stage3_scaling_state,stage3_is_anchor
+250.304,false,false,false,4,2,Compute,3,4,Probing,100.000,None,0,Starved,0,Starved,1471,AboveHighWater,21,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,3,26,0.999996,0.996666,40.000,500.000,Probing,true,Emit,1,4,0.999998,0.759897,40.000,500.000,Eligible,false
+500.743,false,false,true,4,2,Compute,2,4,BackingOff,200.000,Reverted,0,Starved,0,Starved,1448,AboveHighWater,27,AboveHighWater,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,2,49,0.999996,0.998364,80.000,1000.000,BackingOff,true,Emit,7,16,0.999997,0.987493,40.000,500.000,Eligible,false
+751.265,false,false,false,4,2,Compute,3,4,Probing,200.000,Reverted,0,Starved,0,Starved,1421,AboveHighWater,15,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,3,75,0.999992,0.999954,160.000,2000.000,Probing,true,Emit,8,53,0.999997,0.999990,40.000,500.000,Eligible,false
+1001.428,false,false,false,4,2,Compute,4,4,Probing,150.000,Kept,0,Starved,0,Starved,1391,AboveHighWater,5,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,104,0.999993,0.999991,160.000,2000.000,Probing,true,Emit,8,92,0.999998,0.999996,40.000,500.000,Eligible,false
+1251.802,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,1352,AboveHighWater,6,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,143,0.999994,0.999993,160.000,2000.000,BackingOff,true,Emit,8,130,0.999998,0.999997,40.000,500.000,Eligible,false
+1502.223,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,1315,AboveHighWater,4,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,180,0.999984,0.999984,70.502,881.280,Eligible,true,Emit,8,169,0.999997,0.999996,40.000,500.000,Eligible,false
+1752.312,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,1275,AboveHighWater,8,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,220,0.999994,0.999991,42.433,530.413,Eligible,true,Emit,8,205,0.999997,0.999995,40.000,500.000,Eligible,false
+2002.526,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,1237,AboveHighWater,8,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,258,0.999996,0.999992,40.194,502.426,Eligible,true,Emit,8,243,0.999998,0.999997,40.000,500.000,Eligible,false
+2252.740,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,1196,AboveHighWater,10,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,299,0.999995,0.999993,40.014,500.174,Eligible,true,Emit,8,282,0.999998,0.999997,40.000,500.000,Eligible,false
+2502.918,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,1159,AboveHighWater,9,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,336,0.999992,0.999992,40.001,500.014,Eligible,true,Emit,8,320,0.999998,0.999996,40.000,500.000,Eligible,false
+2753.418,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,1119,AboveHighWater,11,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,376,0.999992,0.999992,40.000,500.001,Eligible,true,Emit,8,358,0.999996,0.999996,40.000,500.000,Eligible,false
+3003.763,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,1080,AboveHighWater,11,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,415,0.999995,0.999993,40.000,500.000,Eligible,true,Emit,8,397,0.999996,0.999996,40.000,500.000,Eligible,false
+3254.191,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,1043,AboveHighWater,9,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,452,0.999992,0.999987,40.000,500.000,Eligible,true,Emit,8,436,0.999996,0.999992,40.000,500.000,Eligible,false
+3504.552,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,1002,AboveHighWater,13,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,493,0.999992,0.999992,40.000,500.000,Eligible,true,Emit,8,473,0.999998,0.999997,40.000,500.000,Eligible,false
+3754.773,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,964,AboveHighWater,12,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,531,0.999993,0.999988,40.000,500.000,Eligible,true,Emit,8,512,0.999995,0.999995,40.000,500.000,Eligible,false
+4005.191,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,924,AboveHighWater,15,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,571,0.999991,0.999991,40.000,500.000,Eligible,true,Emit,8,549,0.999997,0.999992,40.000,500.000,Eligible,false
+4255.452,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,886,AboveHighWater,14,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,609,0.999990,0.999990,40.000,500.000,Eligible,true,Emit,8,588,0.999998,0.999997,40.000,500.000,Eligible,false
+4505.606,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,848,AboveHighWater,13,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,647,0.999992,0.999992,40.000,500.000,Eligible,true,Emit,8,627,0.999996,0.999996,40.000,500.000,Eligible,false
+4755.696,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,810,AboveHighWater,13,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,685,0.999990,0.999989,40.000,500.000,Eligible,true,Emit,8,665,0.999996,0.999996,40.000,500.000,Eligible,false
+5005.801,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,771,AboveHighWater,15,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,724,0.999993,0.999988,40.000,500.000,Eligible,true,Emit,8,702,0.999999,0.999997,40.000,500.000,Eligible,false
+5256.330,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,734,AboveHighWater,14,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,761,0.999992,0.999992,40.000,500.000,Eligible,true,Emit,8,740,0.999996,0.999996,40.000,500.000,Eligible,false
+5506.462,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,694,AboveHighWater,15,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,801,0.999988,0.999988,40.000,500.000,Eligible,true,Emit,8,779,0.999996,0.999996,40.000,500.000,Eligible,false
+5756.698,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,656,AboveHighWater,17,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,839,0.999992,0.999992,40.000,500.000,Eligible,true,Emit,8,815,0.999997,0.999997,40.000,500.000,Eligible,false
+6007.101,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,618,AboveHighWater,17,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,877,0.999992,0.999991,40.000,500.000,Eligible,true,Emit,8,853,0.999996,0.999996,40.000,500.000,Eligible,false
+6257.537,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,579,AboveHighWater,16,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,916,0.999996,0.999994,40.000,500.000,Eligible,true,Emit,8,893,0.999996,0.999996,40.000,500.000,Eligible,false
+6507.836,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,539,AboveHighWater,17,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,956,0.999994,0.999994,40.000,500.000,Eligible,true,Emit,8,932,0.999997,0.999997,40.000,500.000,Eligible,false
+6758.104,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,499,AboveHighWater,21,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,996,0.999990,0.999990,40.000,500.000,Eligible,true,Emit,8,968,0.999998,0.999997,40.000,500.000,Eligible,false
+7008.220,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,462,AboveHighWater,20,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1033,0.999993,0.999992,40.000,500.000,Eligible,true,Emit,8,1006,0.999998,0.999996,40.000,500.000,Eligible,false
+7258.508,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,422,AboveHighWater,22,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1073,0.999992,0.999992,40.000,500.000,Eligible,true,Emit,8,1044,0.999997,0.999996,40.000,500.000,Eligible,false
+7509.051,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,384,AboveHighWater,22,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1111,0.999992,0.999992,40.000,500.000,Eligible,true,Emit,8,1082,0.999994,0.999994,40.000,500.000,Eligible,false
+7759.209,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,343,AboveHighWater,23,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1152,0.999990,0.999990,40.000,500.000,Eligible,true,Emit,8,1122,0.999998,0.999996,40.000,500.000,Eligible,false
+8009.419,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,305,AboveHighWater,23,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1190,0.999992,0.999991,40.000,500.000,Eligible,true,Emit,8,1160,0.999997,0.999996,40.000,500.000,Eligible,false
+8259.745,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,266,AboveHighWater,23,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1229,0.999996,0.999993,40.000,500.000,Eligible,true,Emit,8,1199,0.999998,0.999997,40.000,500.000,Eligible,false
+8509.929,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,228,AboveHighWater,25,AboveHighWater,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1267,0.999992,0.999993,40.000,500.000,Eligible,true,Emit,8,1235,0.999998,0.999998,40.000,500.000,Eligible,false
+8760.395,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,189,AboveHighWater,25,AboveHighWater,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1306,0.999996,0.999992,40.000,500.000,Eligible,true,Emit,8,1274,0.999998,0.999997,40.000,500.000,Eligible,false
+9010.680,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,150,AboveHighWater,25,AboveHighWater,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1345,0.999990,0.999994,40.000,500.000,Eligible,true,Emit,9,1312,0.999998,0.999997,40.000,500.000,Eligible,false
+9260.830,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,110,AboveHighWater,19,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1385,0.999994,0.999993,40.000,500.000,Eligible,true,Emit,9,1358,0.999997,0.999996,40.000,500.000,Eligible,false
+9511.080,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,73,AboveHighWater,13,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1422,0.999992,0.999992,40.000,500.000,Eligible,true,Emit,9,1401,0.999996,0.999996,40.000,500.000,Eligible,false
+9761.171,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,34,AboveHighWater,10,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1461,0.999994,0.999994,40.000,500.000,Eligible,true,Emit,9,1443,0.999998,0.999997,40.000,500.000,Eligible,false
+10011.262,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,0,Starved,5,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1499,0.668622,0.999937,40.000,500.000,Eligible,true,Emit,9,1486,0.999998,0.999995,40.000,500.000,Eligible,false
+10261.677,true,false,false,0,2,Compute,0,4,Eligible,112.500,Kept,0,Starved,0,Starved,0,Starved,0,Starved,0,Starved,Prepare,0,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,0,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,0,1499,0.000000,0.999937,40.000,500.000,Eligible,true,Emit,0,1500,0.320776,0.999996,40.000,500.000,Eligible,false
+</script>
+  <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
+  <script>
+    const CHART_COLORS = [
+      "#7eb8ff", "#f59e0b", "#34d399", "#f472b6", "#a78bfa",
+      "#fb7185", "#38bdf8", "#fbbf24", "#4ade80", "#c084fc",
+    ];
+
+    const state = {
+      headers: [],
+      rows: [],
+      visible: [],
+      selectedRowIndex: 0,
+      showAllRows: true,
+      searchQuery: "",
+      logScale: false,
+      plot: null,
+      syncingCursor: false,
+    };
+
+    const fileInput = document.getElementById("fileInput");
+    const dropHint = document.getElementById("dropHint");
+    const logScaleEl = document.getElementById("logScale");
+    const showAllRowsEl = document.getElementById("showAllRows");
+    const chartWrap = document.getElementById("chartWrap");
+    const chartHost = document.getElementById("chartHost");
+    const chartEmpty = document.getElementById("chartEmpty");
+    const chartLegend = document.getElementById("chartLegend");
+    const chartSection = document.getElementById("chartSection");
+    const rowSlider = document.getElementById("rowSlider");
+    const prevRow = document.getElementById("prevRow");
+    const nextRow = document.getElementById("nextRow");
+    const rowLabel = document.getElementById("rowLabel");
+    const statusEl = document.getElementById("status");
+    const columnSearch = document.getElementById("columnSearch");
+    const selectAllBtn = document.getElementById("selectAll");
+    const selectNoneBtn = document.getElementById("selectNone");
+    const columnList = document.getElementById("columnList");
+    const tableWrap = document.getElementById("tableWrap");
+    const emptyState = document.getElementById("emptyState");
+    const dataTable = document.getElementById("dataTable");
+    const tableHead = document.getElementById("tableHead");
+    const tableBody = document.getElementById("tableBody");
+    const detailPanel = document.getElementById("detailPanel");
+    const detailTitle = document.getElementById("detailTitle");
+    const detailGrid = document.getElementById("detailGrid");
+
+    function parseCsvLine(line) {
+      const fields = [];
+      let i = 0;
+      let field = "";
+      while (i < line.length) {
+        if (line[i] === '"') {
+          i += 1;
+          while (i < line.length) {
+            if (line[i] === '"') {
+              if (line[i + 1] === '"') {
+                field += '"';
+                i += 2;
+              } else {
+                i += 1;
+                break;
+              }
+            } else {
+              field += line[i];
+              i += 1;
+            }
+          }
+          if (line[i] === ",") i += 1;
+        } else {
+          while (i < line.length && line[i] !== ",") {
+            field += line[i];
+            i += 1;
+          }
+          if (line[i] === ",") i += 1;
+        }
+        fields.push(field);
+        field = "";
+      }
+      return fields;
+    }
+
+    function parseCsv(text) {
+      const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+      const nonEmpty = lines.filter((l) => l.length > 0);
+      if (nonEmpty.length === 0) return { headers: [], rows: [] };
+      const headers = parseCsvLine(nonEmpty[0]);
+      const colCount = headers.length;
+      const rows = [];
+      for (let r = 1; r < nonEmpty.length; r++) {
+        const cells = parseCsvLine(nonEmpty[r]);
+        while (cells.length < colCount) cells.push("");
+        if (cells.length > colCount) cells.length = colCount;
+        rows.push(cells);
+      }
+      return { headers, rows };
+    }
+
+    function isNumericColumn(ci) {
+      const name = state.headers[ci];
+      if (name === "elapsed_ms") return false;
+      if (/_name$|_state$|_scaling_state$|_probe_state$|_outcome$/.test(name)) return false;
+      if (/^(shutdown_requested|abort_requested|pending_scale_operation|anchor_name)$/.test(name)) return false;
+      if (/^stage\d+_is_anchor$/.test(name)) return false;
+      for (const row of state.rows) {
+        const n = Number(row[ci]);
+        if (Number.isFinite(n)) return true;
+      }
+      return false;
+    }
+
+    function defaultVisible() {
+      const picked = state.headers.map((_, i) => isNumericColumn(i));
+      if (picked.some(Boolean)) return picked;
+      return state.headers.map(() => true);
+    }
+
+    function loadCsvText(text, name) {
+      const { headers, rows } = parseCsv(text);
+      state.headers = headers;
+      state.rows = rows;
+      state.visible = defaultVisible();
+      state.selectedRowIndex = rows.length > 0 ? 0 : -1;
+      statusEl.textContent = `${name}: ${rows.length} rows, ${headers.length} columns`;
+      enableControls(true);
+      buildColumnList();
+      renderAll();
+    }
+
+    function renderAll() {
+      renderChart();
+      renderTable();
+      renderDetail();
+      updateRowControls();
+    }
+
+    function destroyChart() {
+      if (state.plot) {
+        state.plot.destroy();
+        state.plot = null;
+      }
+      chartHost.replaceChildren();
+      chartLegend.replaceChildren();
+    }
+
+    function xAxisIndex() {
+      return state.headers.indexOf("elapsed_ms");
+    }
+
+    function getXValues() {
+      const xi = xAxisIndex();
+      if (xi >= 0) {
+        return state.rows.map((r) => Number(r[xi]));
+      }
+      return state.rows.map((_, i) => i);
+    }
+
+    function chartSeriesIndices() {
+      const xi = xAxisIndex();
+      return visibleColumnIndices().filter((ci) => ci !== xi && isNumericColumn(ci));
+    }
+
+    function renderChartLegend(series) {
+      chartLegend.replaceChildren();
+      series.forEach((ci, si) => {
+        const item = document.createElement("span");
+        item.className = "legend-item";
+        const sw = document.createElement("span");
+        sw.className = "legend-swatch";
+        sw.style.background = CHART_COLORS[si % CHART_COLORS.length];
+        const label = document.createElement("span");
+        label.textContent = state.headers[ci];
+        item.append(sw, label);
+        chartLegend.appendChild(item);
+      });
+    }
+
+    function renderChart() {
+      destroyChart();
+      if (state.rows.length === 0) {
+        chartEmpty.hidden = false;
+        chartEmpty.textContent = "Load CSV and select numeric columns to graph.";
+        return;
+      }
+      const series = chartSeriesIndices();
+      const hasSeries = series.length > 0;
+      chartEmpty.hidden = hasSeries;
+      chartEmpty.textContent = hasSeries
+        ? ""
+        : "Select numeric columns in the sidebar to plot (e.g. busy_ratio, link lengths).";
+      if (!hasSeries) return;
+
+      const x = getXValues();
+      const data = [x];
+      const seriesOpts = [{}];
+      series.forEach((ci, si) => {
+        data.push(
+          state.rows.map((r) => {
+            const n = Number(r[ci]);
+            return Number.isFinite(n) ? n : null;
+          })
+        );
+        seriesOpts.push({
+          label: state.headers[ci],
+          stroke: CHART_COLORS[si % CHART_COLORS.length],
+          width: 2,
+        });
+      });
+
+      const w = Math.max(chartWrap.clientWidth - 16, 320);
+      const h = Math.max(chartWrap.clientHeight - 8, 160);
+      const opts = {
+        width: w,
+        height: h,
+        series: seriesOpts,
+        scales: state.logScale ? { y: { distr: 3 } } : {},
+        axes: [
+          {
+            stroke: "#8b93a1",
+            grid: { stroke: "#2a2f38" },
+            values: (_u, vals) =>
+              vals.map((v) => (v >= 1000 ? `${(v / 1000).toFixed(1)}s` : `${v}ms`)),
+          },
+          {
+            stroke: "#8b93a1",
+            grid: { stroke: "#2a2f38" },
+          },
+        ],
+        cursor: {
+          drag: { x: false, y: false },
+          points: { size: 5, stroke: "#d8dce3", fill: "#14161a" },
+        },
+        hooks: {
+          setCursor: [
+            (u) => {
+              if (state.syncingCursor) return;
+              const idx = u.cursor.idx;
+              if (idx != null && idx >= 0 && idx !== state.selectedRowIndex) {
+                selectRow(idx, { fromChart: true });
+              }
+            },
+          ],
+        },
+      };
+
+      state.plot = new uPlot(opts, data, chartHost);
+      renderChartLegend(series);
+      syncChartCursor();
+    }
+
+    function syncChartCursor() {
+      if (!state.plot || state.selectedRowIndex < 0) return;
+      state.syncingCursor = true;
+      state.plot.setCursor({ idx: state.selectedRowIndex }, true);
+      state.syncingCursor = false;
+    }
+
+    function enableControls(on) {
+      columnSearch.disabled = !on;
+      selectAllBtn.disabled = !on;
+      selectNoneBtn.disabled = !on;
+      const hasRows = on && state.rows.length > 0;
+      rowSlider.disabled = !hasRows;
+      prevRow.disabled = !hasRows;
+      nextRow.disabled = !hasRows;
+      if (hasRows) {
+        rowSlider.max = String(state.rows.length - 1);
+        rowSlider.value = String(Math.max(0, state.selectedRowIndex));
+      }
+      emptyState.hidden = on;
+      dataTable.hidden = !on;
+      detailPanel.hidden = !on || state.rows.length === 0;
+      chartSection.hidden = !on;
+    }
+
+    function visibleColumnIndices() {
+      const out = [];
+      for (let i = 0; i < state.headers.length; i++) {
+        if (state.visible[i]) out.push(i);
+      }
+      return out;
+    }
+
+    function buildColumnList() {
+      columnList.replaceChildren();
+      state.headers.forEach((name, i) => {
+        const item = document.createElement("label");
+        item.className = "column-item";
+        item.dataset.index = String(i);
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = state.visible[i];
+        if (!isNumericColumn(i)) item.style.opacity = "0.55";
+        cb.addEventListener("change", () => {
+          state.visible[i] = cb.checked;
+          renderAll();
+        });
+        const span = document.createElement("span");
+        span.textContent = name;
+        item.append(cb, span);
+        item.addEventListener("click", (e) => {
+          if (e.target === cb) return;
+          cb.checked = !cb.checked;
+          state.visible[i] = cb.checked;
+          renderAll();
+        });
+        columnList.appendChild(item);
+      });
+      applyColumnFilter();
+    }
+
+    let filterDebounce = null;
+    function applyColumnFilter() {
+      const q = state.searchQuery.toLowerCase();
+      columnList.querySelectorAll(".column-item").forEach((el) => {
+        const i = Number(el.dataset.index);
+        const name = state.headers[i] || "";
+        el.classList.toggle("hidden-filter", q.length > 0 && !name.toLowerCase().includes(q));
+      });
+    }
+
+    function renderTable() {
+      const cols = visibleColumnIndices();
+      tableHead.replaceChildren();
+      tableBody.replaceChildren();
+      if (cols.length === 0) {
+        const tr = document.createElement("tr");
+        const th = document.createElement("th");
+        th.textContent = "Select at least one column";
+        tr.appendChild(th);
+        tableHead.appendChild(tr);
+        return;
+      }
+      const headRow = document.createElement("tr");
+      for (const ci of cols) {
+        const th = document.createElement("th");
+        th.textContent = state.headers[ci];
+        headRow.appendChild(th);
+      }
+      tableHead.appendChild(headRow);
+
+      const rowsToShow = state.showAllRows
+        ? state.rows.map((_, i) => i)
+        : state.selectedRowIndex >= 0
+          ? [state.selectedRowIndex]
+          : [];
+
+      for (const ri of rowsToShow) {
+        const tr = document.createElement("tr");
+        if (ri === state.selectedRowIndex) tr.classList.add("selected");
+        tr.dataset.rowIndex = String(ri);
+        for (const ci of cols) {
+          const td = document.createElement("td");
+          td.textContent = state.rows[ri][ci] ?? "";
+          tr.appendChild(td);
+        }
+        tr.addEventListener("click", () => selectRow(ri));
+        tableBody.appendChild(tr);
+      }
+    }
+
+    function renderDetail() {
+      detailGrid.replaceChildren();
+      if (state.selectedRowIndex < 0 || state.rows.length === 0) return;
+      const ri = state.selectedRowIndex;
+      detailTitle.textContent = `Row ${ri + 1} of ${state.rows.length}`;
+      const cols = visibleColumnIndices();
+      for (const ci of cols) {
+        const pair = document.createElement("div");
+        pair.className = "detail-pair";
+        const dt = document.createElement("dt");
+        dt.textContent = state.headers[ci];
+        const dd = document.createElement("dd");
+        dd.textContent = state.rows[ri][ci] ?? "";
+        pair.append(dt, dd);
+        detailGrid.appendChild(pair);
+      }
+    }
+
+    function selectRow(index, opts = {}) {
+      if (index < 0 || index >= state.rows.length) return;
+      state.selectedRowIndex = index;
+      rowSlider.value = String(index);
+      updateRowControls();
+      renderTable();
+      renderDetail();
+      if (!opts.fromChart) syncChartCursor();
+      const row = tableBody.querySelector(`tr[data-row-index="${index}"]`);
+      if (row) row.scrollIntoView({ block: "nearest" });
+    }
+
+    function updateRowControls() {
+      const n = state.rows.length;
+      if (n === 0) {
+        rowLabel.textContent = "—";
+        return;
+      }
+      const i = state.selectedRowIndex;
+      const elapsed = state.headers.indexOf("elapsed_ms");
+      const ms = elapsed >= 0 ? state.rows[i][elapsed] : "";
+      rowLabel.textContent = ms ? `Row ${i + 1} · ${ms} ms` : `Row ${i + 1} / ${n}`;
+      prevRow.disabled = i <= 0;
+      nextRow.disabled = i >= n - 1;
+    }
+
+    fileInput.addEventListener("change", () => {
+      const file = fileInput.files?.[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => loadCsvText(reader.result, file.name);
+      reader.readAsText(file);
+    });
+
+    document.body.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      dropHint.classList.add("drag-over");
+    });
+    document.body.addEventListener("dragleave", () => {
+      dropHint.classList.remove("drag-over");
+    });
+    document.body.addEventListener("drop", (e) => {
+      e.preventDefault();
+      dropHint.classList.remove("drag-over");
+      const file = e.dataTransfer?.files?.[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => loadCsvText(reader.result, file.name);
+      reader.readAsText(file);
+    });
+
+    logScaleEl.addEventListener("change", () => {
+      state.logScale = logScaleEl.checked;
+      renderChart();
+    });
+
+    showAllRowsEl.addEventListener("change", () => {
+      state.showAllRows = showAllRowsEl.checked;
+      renderTable();
+    });
+
+    let resizeDebounce = null;
+    const resizeObserver = new ResizeObserver(() => {
+      clearTimeout(resizeDebounce);
+      resizeDebounce = setTimeout(() => {
+        if (state.plot) renderChart();
+      }, 80);
+    });
+    resizeObserver.observe(chartWrap);
+
+    rowSlider.addEventListener("input", () => {
+      selectRow(Number(rowSlider.value));
+    });
+    prevRow.addEventListener("click", () => selectRow(state.selectedRowIndex - 1));
+    nextRow.addEventListener("click", () => selectRow(state.selectedRowIndex + 1));
+
+    columnSearch.addEventListener("input", () => {
+      state.searchQuery = columnSearch.value;
+      clearTimeout(filterDebounce);
+      filterDebounce = setTimeout(applyColumnFilter, 100);
+    });
+
+    selectAllBtn.addEventListener("click", () => {
+      state.visible = state.headers.map(() => true);
+      columnList.querySelectorAll('input[type="checkbox"]').forEach((cb) => { cb.checked = true; });
+      renderAll();
+    });
+    selectNoneBtn.addEventListener("click", () => {
+      state.visible = state.headers.map(() => false);
+      columnList.querySelectorAll('input[type="checkbox"]').forEach((cb) => { cb.checked = false; });
+      renderAll();
+    });
+
+    tableWrap.addEventListener("keydown", (e) => {
+      if (state.rows.length === 0) return;
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        selectRow(Math.min(state.selectedRowIndex + 1, state.rows.length - 1));
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        selectRow(Math.max(state.selectedRowIndex - 1, 0));
+      }
+    });
+
+    function loadEmbeddedCsv() {
+      const el = document.getElementById("embeddedCsv");
+      if (!el || !el.textContent.trim()) return;
+      loadCsvText(el.textContent, "piper_1779306281518.csv");
+    }
+
+    const params = new URLSearchParams(location.search);
+    const csvParam = params.get("csv");
+    if (csvParam) {
+      fetch(csvParam)
+        .then((r) => {
+          if (!r.ok) throw new Error(r.statusText);
+          return r.text();
+        })
+        .then((text) => loadCsvText(text, csvParam))
+        .catch(loadEmbeddedCsv);
+    } else {
+      loadEmbeddedCsv();
+    }
+  </script>
+</body>
+</html>

@@ -16,11 +16,7 @@ fn config() -> PiperConfig {
     PiperConfig {
         sample_interval: Duration::from_millis(1),
         poll_interval: Duration::from_millis(1),
-        scale_cooldown: Duration::from_millis(1),
-        add_dwell: Duration::from_millis(2),
-        remove_dwell: Duration::from_millis(5),
-        low_water: 1,
-        high_water: 2,
+        global_worker_cap: Some(8),
         csv_telemetry: None,
     }
 }
@@ -143,6 +139,8 @@ fn get_telemetry_reports_operational_state() {
     assert_eq!(telemetry.stages[1].active_threads, 1);
     assert_eq!(telemetry.anchor.stage_index, 1);
     assert_eq!(telemetry.anchor.max_threads, 1);
+    assert_eq!(telemetry.global_worker_cap, 8);
+    assert_eq!(telemetry.total_active_workers, 2);
     assert!(telemetry.stages.iter().any(|stage| stage.is_anchor));
     assert!(telemetry.parked_threads >= 2);
 
@@ -254,7 +252,9 @@ fn csv_telemetry_writes_wide_rows_and_existing_path_fails() {
 
     let csv = fs::read_to_string(&path).unwrap();
     assert!(csv.starts_with("elapsed_ms,shutdown_requested"));
-    assert!(csv.contains("stage0_busy_ratio"));
+    assert!(csv.contains("link0_trend"));
+    assert!(csv.contains("stage0_service_time_ms"));
+    assert!(csv.contains("output_backpressure"));
     assert!(csv.lines().count() >= 2);
 
     let existing = Piper::<u32, u32, TestError>::start(

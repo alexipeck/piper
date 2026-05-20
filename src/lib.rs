@@ -193,11 +193,7 @@ where
 pub struct PiperConfig {
     pub sample_interval: Duration,
     pub poll_interval: Duration,
-    pub scale_cooldown: Duration,
-    pub add_dwell: Duration,
-    pub remove_dwell: Duration,
-    pub low_water: usize,
-    pub high_water: usize,
+    pub global_worker_cap: Option<usize>,
     pub csv_telemetry: Option<CsvTelemetryConfig>,
 }
 
@@ -206,11 +202,7 @@ impl Default for PiperConfig {
         Self {
             sample_interval: Duration::from_millis(10),
             poll_interval: Duration::from_millis(10),
-            scale_cooldown: Duration::from_millis(10),
-            add_dwell: Duration::from_millis(50),
-            remove_dwell: Duration::from_millis(250),
-            low_water: 1,
-            high_water: 64,
+            global_worker_cap: None,
             csv_telemetry: None,
         }
     }
@@ -237,28 +229,34 @@ impl CsvTelemetryConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WaterState {
+#[repr(u8)]
+pub enum QueueTrend {
     Starved,
-    BelowLowWater,
-    Nominal,
-    AboveHighWater,
+    FastDraining,
+    Draining,
+    Stable,
+    Growing,
+    FastGrowing,
+    Runaway,
 }
 
-impl WaterState {
-    pub fn classify(len: usize, low_water: usize, high_water: usize) -> Self {
-        if len == 0 {
-            WaterState::Starved
-        } else if len < low_water {
-            WaterState::BelowLowWater
-        } else if len > high_water {
-            WaterState::AboveHighWater
-        } else {
-            WaterState::Nominal
-        }
+impl QueueTrend {
+    pub fn code(self) -> u8 {
+        self as u8
     }
 
-    pub fn is_low_pressure(self) -> bool {
-        matches!(self, WaterState::Starved | WaterState::BelowLowWater)
+    pub fn is_draining(self) -> bool {
+        matches!(
+            self,
+            QueueTrend::Starved | QueueTrend::FastDraining | QueueTrend::Draining
+        )
+    }
+
+    pub fn is_growing(self) -> bool {
+        matches!(
+            self,
+            QueueTrend::Growing | QueueTrend::FastGrowing | QueueTrend::Runaway
+        )
     }
 }
 
@@ -266,7 +264,11 @@ impl WaterState {
 pub struct LinkSnapshot {
     pub index: usize,
     pub len: usize,
-    pub state: WaterState,
+    pub trend: QueueTrend,
+    pub arrival_rate: f64,
+    pub drain_rate: f64,
+    pub net_rate: f64,
+    pub smoothed_len: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -276,9 +278,9 @@ pub struct StageSnapshot {
     pub active_threads: usize,
     pub processed_count: u64,
     pub busy_ratio: f64,
-    pub busy_ceiling: f64,
-    pub effective_add_dwell: Duration,
-    pub effective_remove_dwell: Duration,
+    pub service_time: Duration,
+    pub per_worker_throughput: f64,
+    pub desired_workers: usize,
     pub scaling_state: StageScalingState,
     pub is_anchor: bool,
 }
@@ -307,6 +309,16 @@ pub enum AnchorProbeOutcome {
     Reverted,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AnchorProbeReason {
+    None,
+    InputUnderfed,
+    OutputBackpressure,
+    BudgetPressure,
+    SupportUnstable,
+    Idle,
+}
+
 #[derive(Clone, Debug)]
 pub struct AnchorSnapshot {
     pub stage_index: usize,
@@ -314,8 +326,8 @@ pub struct AnchorSnapshot {
     pub active_threads: usize,
     pub max_threads: usize,
     pub probe_state: AnchorProbeState,
-    pub effective_probe_interval: Duration,
     pub last_probe_outcome: AnchorProbeOutcome,
+    pub last_probe_reason: AnchorProbeReason,
 }
 
 #[derive(Clone, Debug)]
@@ -324,6 +336,10 @@ pub struct PiperSnapshot {
     pub stages: Vec<StageSnapshot>,
     pub anchor: AnchorSnapshot,
     pub parked_threads: usize,
+    pub total_active_workers: usize,
+    pub global_worker_cap: usize,
+    pub budget_pressure: bool,
+    pub output_backpressure: bool,
     pub shutdown_requested: bool,
     pub abort_requested: bool,
     pub pending_scale_operation: bool,
@@ -355,6 +371,7 @@ pub enum TryRecvOutputError {
 
 pub struct PiperSender<In> {
     inner: kanal::Sender<Message>,
+    stats: Arc<LinkStats>,
     shutdown: Arc<AtomicBool>,
     _marker: PhantomData<fn(In)>,
 }
@@ -363,6 +380,7 @@ impl<In> Clone for PiperSender<In> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            stats: Arc::clone(&self.stats),
             shutdown: Arc::clone(&self.shutdown),
             _marker: PhantomData,
         }
@@ -377,7 +395,11 @@ where
         if self.shutdown.load(Ordering::Acquire) {
             return Err(SendInputError);
         }
-        self.inner.send(Box::new(input)).map_err(|_| SendInputError)
+        self.inner
+            .send(Box::new(input))
+            .map_err(|_| SendInputError)?;
+        self.stats.arrivals.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn is_closed(&self) -> bool {
@@ -387,6 +409,7 @@ where
 
 pub struct PiperReceiver<Out> {
     inner: kanal::Receiver<Message>,
+    stats: Arc<LinkStats>,
     _marker: PhantomData<fn() -> Out>,
 }
 
@@ -394,6 +417,7 @@ impl<Out> Clone for PiperReceiver<Out> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            stats: Arc::clone(&self.stats),
             _marker: PhantomData,
         }
     }
@@ -405,6 +429,7 @@ where
 {
     pub fn recv(&self) -> std::result::Result<Out, RecvOutputError> {
         let output = self.inner.recv().map_err(|_| RecvOutputError::Closed)?;
+        self.stats.drains.fetch_add(1, Ordering::Relaxed);
         output
             .downcast::<Out>()
             .map(|value| *value)
@@ -421,6 +446,7 @@ where
                     RecvOutputError::Closed
                 }
             })?;
+        self.stats.drains.fetch_add(1, Ordering::Relaxed);
         output
             .downcast::<Out>()
             .map(|value| *value)
@@ -435,6 +461,7 @@ where
                 return Err(TryRecvOutputError::Closed);
             }
         };
+        self.stats.drains.fetch_add(1, Ordering::Relaxed);
         output
             .downcast::<Out>()
             .map(|value| *value)
@@ -548,6 +575,7 @@ where
     E: Debug + Display + Send + 'static,
 {
     output: kanal::Sender<Message>,
+    output_stats: Arc<LinkStats>,
     output_acquire: Option<Arc<AcquireFn<Out>>>,
     shutdown: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
@@ -561,14 +589,20 @@ where
     E: Debug + Display + Send + 'static,
 {
     pub fn emit(&mut self, output: Out) {
-        if self.output.send(Box::new(output)).is_err()
-            && !self.shutdown.load(Ordering::Acquire)
-            && !self.abort.load(Ordering::Acquire)
-        {
-            self.abort.store(true, Ordering::Release);
-            let _ = self.internal_failure.send(InternalFailure::internal(
-                "stage output channel closed unexpectedly",
-            ));
+        match self.output.send(Box::new(output)) {
+            Ok(()) => {
+                self.output_stats.arrivals.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_)
+                if !self.shutdown.load(Ordering::Acquire)
+                    && !self.abort.load(Ordering::Acquire) =>
+            {
+                self.abort.store(true, Ordering::Release);
+                let _ = self.internal_failure.send(InternalFailure::internal(
+                    "stage output channel closed unexpectedly",
+                ));
+            }
+            Err(_) => {}
         }
     }
 
@@ -626,6 +660,7 @@ where
 
 struct RuntimeStageContext {
     output: kanal::Sender<Message>,
+    output_stats: Arc<LinkStats>,
     output_acquire: Option<DynAcquire>,
     shutdown: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
@@ -676,6 +711,7 @@ where
         };
         let mut ctx = StageContext {
             output: ctx.output,
+            output_stats: ctx.output_stats,
             output_acquire,
             shutdown: ctx.shutdown,
             abort: ctx.abort,
@@ -763,7 +799,6 @@ where
     stage: Arc<dyn DynStage<E>>,
     output_acquire_builder: Option<Arc<dyn OutputAcquireBuilder + Send + Sync>>,
     anchor: Option<AnchorHints>,
-    dwell_hints: StageDwellHints,
 }
 
 impl<E> StageSpec<E>
@@ -782,22 +817,6 @@ where
         self
     }
 
-    pub fn with_dwell(mut self, add: Duration, remove: Duration) -> Self {
-        self.dwell_hints.add = Some(add);
-        self.dwell_hints.remove = Some(remove);
-        self
-    }
-
-    pub fn with_add_dwell(mut self, add: Duration) -> Self {
-        self.dwell_hints.add = Some(add);
-        self
-    }
-
-    pub fn with_remove_dwell(mut self, remove: Duration) -> Self {
-        self.dwell_hints.remove = Some(remove);
-        self
-    }
-
     pub fn max_threads(mut self, max_threads: usize) -> Self {
         self.anchor
             .get_or_insert_with(AnchorHints::default)
@@ -811,42 +830,12 @@ where
             .initial_threads = Some(initial_threads);
         self
     }
-
-    pub fn probe_interval(mut self, interval: Duration) -> Self {
-        self.anchor
-            .get_or_insert_with(AnchorHints::default)
-            .probe_interval = Some(interval);
-        self
-    }
-
-    pub fn probe_window(mut self, window: Duration) -> Self {
-        self.anchor
-            .get_or_insert_with(AnchorHints::default)
-            .probe_window = Some(window);
-        self
-    }
-
-    pub fn remove_dwell(mut self, dwell: Duration) -> Self {
-        self.anchor
-            .get_or_insert_with(AnchorHints::default)
-            .remove_dwell = Some(dwell);
-        self
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct StageDwellHints {
-    add: Option<Duration>,
-    remove: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct AnchorHints {
     max_threads: Option<usize>,
     initial_threads: Option<usize>,
-    probe_interval: Option<Duration>,
-    probe_window: Option<Duration>,
-    remove_dwell: Option<Duration>,
 }
 
 pub trait IntoStageSpec<E>
@@ -882,18 +871,6 @@ pub trait StageExt: Stage + Sized {
     {
         stage(default_stage_name::<Self>(), self).with_reusable_output(factory)
     }
-
-    fn with_dwell(self, add: Duration, remove: Duration) -> StageSpec<Self::Error> {
-        stage(default_stage_name::<Self>(), self).with_dwell(add, remove)
-    }
-
-    fn with_add_dwell(self, add: Duration) -> StageSpec<Self::Error> {
-        stage(default_stage_name::<Self>(), self).with_add_dwell(add)
-    }
-
-    fn with_remove_dwell(self, remove: Duration) -> StageSpec<Self::Error> {
-        stage(default_stage_name::<Self>(), self).with_remove_dwell(remove)
-    }
 }
 
 impl<S> StageExt for S where S: Stage {}
@@ -907,7 +884,6 @@ where
         stage: Arc::new(StageAdapter { stage: stage_impl }),
         output_acquire_builder: None,
         anchor: None,
-        dwell_hints: StageDwellHints::default(),
     }
 }
 
@@ -1105,6 +1081,13 @@ impl InternalFailure {
 struct Link {
     sender: Option<kanal::Sender<Message>>,
     receiver: kanal::Receiver<Message>,
+    stats: Arc<LinkStats>,
+}
+
+#[derive(Default)]
+struct LinkStats {
+    arrivals: AtomicU64,
+    drains: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -1116,16 +1099,12 @@ where
     stage: Arc<dyn DynStage<E>>,
     output_acquire: Option<DynAcquire>,
     anchor: Option<ResolvedAnchor>,
-    dwell_hints: StageDwellHints,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct ResolvedAnchor {
     max_threads: usize,
     initial_threads: usize,
-    probe_interval: Duration,
-    probe_window: Duration,
-    remove_dwell: Duration,
 }
 
 enum WorkerCommand<E>
@@ -1143,7 +1122,9 @@ where
     stage_index: usize,
     stage: Arc<dyn DynStage<E>>,
     input: kanal::Receiver<Message>,
+    input_stats: Arc<LinkStats>,
     output: kanal::Sender<Message>,
+    output_stats: Arc<LinkStats>,
     output_acquire: Option<DynAcquire>,
     retire: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
@@ -1211,6 +1192,8 @@ enum ScaleReason {
     Support,
     AnchorProbe,
     AnchorRevert,
+    BudgetPressure,
+    Idle,
 }
 
 struct PendingScale {
@@ -1220,52 +1203,35 @@ struct PendingScale {
     reason: ScaleReason,
 }
 
-#[derive(Clone, Copy)]
-struct PressureTimer {
-    state: WaterState,
-    low_since: Option<Instant>,
-    high_since: Option<Instant>,
-}
-
-impl Default for PressureTimer {
-    fn default() -> Self {
-        Self {
-            state: WaterState::Starved,
-            low_since: None,
-            high_since: None,
-        }
-    }
-}
-
 struct StageControl {
-    base_add_dwell: Duration,
-    base_remove_dwell: Duration,
-    effective_add_dwell: Duration,
-    effective_remove_dwell: Duration,
     processed_count: u64,
     busy_ratio: f64,
-    busy_ceiling: f64,
+    service_time_ewma: f64,
+    per_worker_throughput: f64,
+    desired_workers: usize,
     last_sample_processed: u64,
     scaling_state: StageScalingState,
     settling: bool,
+    settle_samples: u32,
+    settle_observed_work: bool,
+    idle_samples: u32,
     last_operation: Option<(ScaleDirection, Instant)>,
     anchor: Option<AnchorControl>,
 }
 
 struct AnchorControl {
     max_threads: usize,
-    probe_interval: Duration,
-    probe_window: Duration,
-    remove_dwell: Duration,
     warmup_complete: bool,
     probe: Option<AnchorProbe>,
-    next_probe_after: Instant,
+    cooldown_samples: u32,
     last_probe_outcome: AnchorProbeOutcome,
+    last_probe_reason: AnchorProbeReason,
 }
 
 struct AnchorProbe {
     worker_id: usize,
-    started_at: Instant,
+    samples: u32,
+    observed_work: bool,
 }
 
 #[derive(Default)]
@@ -1273,6 +1239,35 @@ struct StageSample {
     process_nanos: u64,
     wait_nanos: u64,
     processed_items: u64,
+}
+
+#[derive(Clone, Debug)]
+struct LinkControl {
+    last_arrivals: u64,
+    last_drains: u64,
+    len: usize,
+    previous_len: usize,
+    smoothed_len: f64,
+    arrival_rate: f64,
+    drain_rate: f64,
+    net_rate: f64,
+    trend: QueueTrend,
+}
+
+impl Default for LinkControl {
+    fn default() -> Self {
+        Self {
+            last_arrivals: 0,
+            last_drains: 0,
+            len: 0,
+            previous_len: 0,
+            smoothed_len: 0.0,
+            arrival_rate: 0.0,
+            drain_rate: 0.0,
+            net_rate: 0.0,
+            trend: QueueTrend::Starved,
+        }
+    }
 }
 
 fn resolve_anchor_hints<E>(hints: AnchorHints) -> Result<ResolvedAnchor, E>
@@ -1297,47 +1292,48 @@ where
     Ok(ResolvedAnchor {
         max_threads,
         initial_threads: initial_threads.min(max_threads),
-        probe_interval: hints.probe_interval.unwrap_or(Duration::from_millis(100)),
-        probe_window: hints.probe_window.unwrap_or(Duration::from_millis(250)),
-        remove_dwell: hints.remove_dwell.unwrap_or(Duration::from_millis(500)),
     })
 }
 
-fn build_stage_controls<E>(config: &PiperConfig, stages: &[RuntimeStage<E>]) -> Vec<StageControl>
+fn build_stage_controls<E>(stages: &[RuntimeStage<E>]) -> Vec<StageControl>
 where
     E: Debug + Display + Send + 'static,
 {
-    let now = Instant::now();
     stages
         .iter()
-        .map(|stage| {
-            let base_add_dwell = stage.dwell_hints.add.unwrap_or(config.add_dwell);
-            let base_remove_dwell = stage.dwell_hints.remove.unwrap_or(config.remove_dwell);
-            StageControl {
-                base_add_dwell,
-                base_remove_dwell,
-                effective_add_dwell: base_add_dwell,
-                effective_remove_dwell: base_remove_dwell,
-                processed_count: 0,
-                busy_ratio: 0.0,
-                busy_ceiling: 0.0,
-                last_sample_processed: 0,
-                scaling_state: StageScalingState::Eligible,
-                settling: false,
-                last_operation: None,
-                anchor: stage.anchor.map(|anchor| AnchorControl {
-                    max_threads: anchor.max_threads,
-                    probe_interval: anchor.probe_interval,
-                    probe_window: anchor.probe_window,
-                    remove_dwell: anchor.remove_dwell,
-                    warmup_complete: false,
-                    probe: None,
-                    next_probe_after: now,
-                    last_probe_outcome: AnchorProbeOutcome::None,
-                }),
-            }
+        .map(|stage| StageControl {
+            processed_count: 0,
+            busy_ratio: 0.0,
+            service_time_ewma: 0.0,
+            per_worker_throughput: 0.0,
+            desired_workers: 1,
+            last_sample_processed: 0,
+            scaling_state: StageScalingState::Eligible,
+            settling: false,
+            settle_samples: 0,
+            settle_observed_work: false,
+            idle_samples: 0,
+            last_operation: None,
+            anchor: stage.anchor.map(|anchor| AnchorControl {
+                max_threads: anchor.max_threads,
+                warmup_complete: false,
+                probe: None,
+                cooldown_samples: 0,
+                last_probe_outcome: AnchorProbeOutcome::None,
+                last_probe_reason: AnchorProbeReason::None,
+            }),
         })
         .collect()
+}
+
+fn resolve_global_worker_cap(configured: Option<usize>, stage_count: usize) -> usize {
+    let available = thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .max(1);
+    configured
+        .unwrap_or_else(|| available.saturating_mul(2).max(stage_count))
+        .max(stage_count)
 }
 
 pub struct Piper<In, Out, E = String>
@@ -1386,6 +1382,7 @@ where
             links.push(Link {
                 sender: Some(sender),
                 receiver,
+                stats: Arc::new(LinkStats::default()),
             });
         }
 
@@ -1395,6 +1392,8 @@ where
             .expect("input sender exists")
             .clone();
         let output_receiver = links[stages.len()].receiver.clone();
+        let input_stats = Arc::clone(&links[0].stats);
+        let output_stats = Arc::clone(&links[stages.len()].stats);
 
         let runtime_stages: Vec<_> = stages
             .into_iter()
@@ -1407,7 +1406,6 @@ where
                         .output_acquire_builder
                         .map(|builder| builder.build(lease_runtime.clone())),
                     anchor,
-                    dwell_hints: stage.dwell_hints,
                 })
             })
             .collect::<Result<Vec<_>, E>>()?;
@@ -1419,13 +1417,19 @@ where
         let anchor_stage = runtime_stages[anchor_index]
             .anchor
             .expect("validated exactly one anchor");
+        let global_worker_cap =
+            resolve_global_worker_cap(config.global_worker_cap, runtime_stages.len());
 
         let snapshot = Arc::new(RwLock::new(PiperSnapshot {
             links: (0..=runtime_stages.len())
                 .map(|index| LinkSnapshot {
                     index,
                     len: 0,
-                    state: WaterState::Starved,
+                    trend: QueueTrend::Starved,
+                    arrival_rate: 0.0,
+                    drain_rate: 0.0,
+                    net_rate: 0.0,
+                    smoothed_len: 0.0,
                 })
                 .collect(),
             stages: runtime_stages
@@ -1437,9 +1441,9 @@ where
                     active_threads: 0,
                     processed_count: 0,
                     busy_ratio: 0.0,
-                    busy_ceiling: 0.0,
-                    effective_add_dwell: stage.dwell_hints.add.unwrap_or(config.add_dwell),
-                    effective_remove_dwell: stage.dwell_hints.remove.unwrap_or(config.remove_dwell),
+                    service_time: Duration::ZERO,
+                    per_worker_throughput: 0.0,
+                    desired_workers: 1,
                     scaling_state: StageScalingState::Eligible,
                     is_anchor: stage.anchor.is_some(),
                 })
@@ -1450,10 +1454,14 @@ where
                 active_threads: 0,
                 max_threads: anchor_stage.max_threads,
                 probe_state: AnchorProbeState::WarmingUp,
-                effective_probe_interval: anchor_stage.probe_interval,
                 last_probe_outcome: AnchorProbeOutcome::None,
+                last_probe_reason: AnchorProbeReason::None,
             },
             parked_threads: 0,
+            total_active_workers: 0,
+            global_worker_cap,
+            budget_pressure: false,
+            output_backpressure: false,
             shutdown_requested: false,
             abort_requested: false,
             pending_scale_operation: false,
@@ -1492,11 +1500,13 @@ where
         Ok(Piper {
             sender: PiperSender {
                 inner: input_sender,
+                stats: input_stats,
                 shutdown: Arc::clone(&shutdown),
                 _marker: PhantomData,
             },
             receiver: PiperReceiver {
                 inner: output_receiver,
+                stats: output_stats,
                 _marker: PhantomData,
             },
             shutdown,
@@ -1642,18 +1652,26 @@ fn csv_header(snapshot: &PiperSnapshot) -> String {
         "abort_requested".to_string(),
         "pending_scale_operation".to_string(),
         "parked_threads".to_string(),
+        "total_active_workers".to_string(),
+        "global_worker_cap".to_string(),
+        "budget_pressure".to_string(),
+        "output_backpressure".to_string(),
         "anchor_index".to_string(),
         "anchor_name".to_string(),
         "anchor_active_threads".to_string(),
         "anchor_max_threads".to_string(),
         "anchor_probe_state".to_string(),
-        "anchor_effective_probe_interval_ms".to_string(),
         "anchor_last_probe_outcome".to_string(),
+        "anchor_last_probe_reason".to_string(),
     ];
 
     for link in &snapshot.links {
         fields.push(format!("link{}_len", link.index));
-        fields.push(format!("link{}_state", link.index));
+        fields.push(format!("link{}_trend", link.index));
+        fields.push(format!("link{}_arrival_rate", link.index));
+        fields.push(format!("link{}_drain_rate", link.index));
+        fields.push(format!("link{}_net_rate", link.index));
+        fields.push(format!("link{}_smoothed_len", link.index));
     }
 
     for stage in &snapshot.stages {
@@ -1661,9 +1679,9 @@ fn csv_header(snapshot: &PiperSnapshot) -> String {
         fields.push(format!("stage{}_active_threads", stage.index));
         fields.push(format!("stage{}_processed_count", stage.index));
         fields.push(format!("stage{}_busy_ratio", stage.index));
-        fields.push(format!("stage{}_busy_ceiling", stage.index));
-        fields.push(format!("stage{}_effective_add_dwell_ms", stage.index));
-        fields.push(format!("stage{}_effective_remove_dwell_ms", stage.index));
+        fields.push(format!("stage{}_service_time_ms", stage.index));
+        fields.push(format!("stage{}_per_worker_throughput", stage.index));
+        fields.push(format!("stage{}_desired_workers", stage.index));
         fields.push(format!("stage{}_scaling_state", stage.index));
         fields.push(format!("stage{}_is_anchor", stage.index));
     }
@@ -1678,21 +1696,26 @@ fn csv_row(elapsed: Duration, snapshot: &PiperSnapshot) -> String {
         snapshot.abort_requested.to_string(),
         snapshot.pending_scale_operation.to_string(),
         snapshot.parked_threads.to_string(),
+        snapshot.total_active_workers.to_string(),
+        snapshot.global_worker_cap.to_string(),
+        snapshot.budget_pressure.to_string(),
+        snapshot.output_backpressure.to_string(),
         snapshot.anchor.stage_index.to_string(),
         csv_escape(&snapshot.anchor.stage_name),
         snapshot.anchor.active_threads.to_string(),
         snapshot.anchor.max_threads.to_string(),
         format!("{:?}", snapshot.anchor.probe_state),
-        format!(
-            "{:.3}",
-            snapshot.anchor.effective_probe_interval.as_secs_f64() * 1000.0
-        ),
         format!("{:?}", snapshot.anchor.last_probe_outcome),
+        format!("{:?}", snapshot.anchor.last_probe_reason),
     ];
 
     for link in &snapshot.links {
         fields.push(link.len.to_string());
-        fields.push(format!("{:?}", link.state));
+        fields.push(link.trend.code().to_string());
+        fields.push(format!("{:.6}", link.arrival_rate));
+        fields.push(format!("{:.6}", link.drain_rate));
+        fields.push(format!("{:.6}", link.net_rate));
+        fields.push(format!("{:.6}", link.smoothed_len));
     }
 
     for stage in &snapshot.stages {
@@ -1700,15 +1723,9 @@ fn csv_row(elapsed: Duration, snapshot: &PiperSnapshot) -> String {
         fields.push(stage.active_threads.to_string());
         fields.push(stage.processed_count.to_string());
         fields.push(format!("{:.6}", stage.busy_ratio));
-        fields.push(format!("{:.6}", stage.busy_ceiling));
-        fields.push(format!(
-            "{:.3}",
-            stage.effective_add_dwell.as_secs_f64() * 1000.0
-        ));
-        fields.push(format!(
-            "{:.3}",
-            stage.effective_remove_dwell.as_secs_f64() * 1000.0
-        ));
+        fields.push(format!("{:.3}", stage.service_time.as_secs_f64() * 1000.0));
+        fields.push(format!("{:.6}", stage.per_worker_throughput));
+        fields.push(stage.desired_workers.to_string());
         fields.push(format!("{:?}", stage.scaling_state));
         fields.push(stage.is_anchor.to_string());
     }
@@ -1745,20 +1762,26 @@ where
     let mut workers = Vec::new();
     let mut active_by_stage = vec![Vec::<usize>::new(); stages.len()];
     let mut parked = Vec::new();
-    let mut pressure = vec![PressureTimer::default(); links.len()];
-    let mut controls = build_stage_controls(&config, &stages);
+    let mut link_controls = vec![LinkControl::default(); links.len()];
+    let mut controls = build_stage_controls(&stages);
     let anchor_index = stages
         .iter()
         .position(|stage| stage.anchor.is_some())
         .expect("validated exactly one anchor");
+    let global_worker_cap = resolve_global_worker_cap(config.global_worker_cap, stages.len());
     let mut pending_scale = None;
-    let mut last_scale_completed = Instant::now();
     let mut stored_failure = None;
     let mut supervisor_holds_links = true;
+    let mut last_sample_at = Instant::now();
 
     for stage_index in 0..stages.len() {
         let active_count = if let Some(anchor) = stages[stage_index].anchor {
-            anchor.initial_threads
+            let support_minimum = stages.len().saturating_sub(1);
+            let anchor_budget = global_worker_cap.saturating_sub(support_minimum).max(1);
+            anchor
+                .initial_threads
+                .min(anchor.max_threads)
+                .min(anchor_budget)
         } else {
             1
         };
@@ -1792,9 +1815,10 @@ where
         &stages,
         &active_by_stage,
         parked.len(),
-        &pressure,
+        &link_controls,
         &controls,
         anchor_index,
+        global_worker_cap,
         shutdown.load(Ordering::Acquire),
         abort.load(Ordering::Acquire),
         pending_scale.is_some(),
@@ -1808,7 +1832,6 @@ where
             &mut parked,
             &mut controls,
             &mut pending_scale,
-            &mut last_scale_completed,
             &abort,
             &mut stored_failure,
         );
@@ -1836,18 +1859,27 @@ where
             }
         }
 
-        sample_pressure(&links, &config, &mut pressure);
-        collect_stage_samples(&workers, &active_by_stage, &pressure, &mut controls);
+        let now = Instant::now();
+        let sample_elapsed = now
+            .duration_since(last_sample_at)
+            .max(Duration::from_micros(1));
+        last_sample_at = now;
+        sample_links(&links, sample_elapsed, &mut link_controls);
+        collect_stage_samples(&workers, &active_by_stage, &link_controls, &mut controls);
+        update_desired_workers(&link_controls, &active_by_stage, &mut controls);
 
         if !shutdown.load(Ordering::Acquire)
             && !abort.load(Ordering::Acquire)
             && stored_failure.is_none()
             && pending_scale.is_none()
-            && last_scale_completed.elapsed() >= config.scale_cooldown
         {
-            if let Some(operation) =
-                choose_scale_operation(&pressure, &active_by_stage, &mut controls, anchor_index)
-            {
+            if let Some(operation) = choose_scale_operation(
+                &link_controls,
+                &active_by_stage,
+                &mut controls,
+                anchor_index,
+                global_worker_cap,
+            ) {
                 match operation {
                     ScaleOperation::Add {
                         stage_index,
@@ -1915,9 +1947,10 @@ where
             &stages,
             &active_by_stage,
             parked.len(),
-            &pressure,
+            &link_controls,
             &controls,
             anchor_index,
+            global_worker_cap,
             shutdown.load(Ordering::Acquire),
             abort.load(Ordering::Acquire),
             pending_scale.is_some(),
@@ -1956,9 +1989,10 @@ where
         &stages,
         &active_by_stage,
         0,
-        &pressure,
+        &link_controls,
         &controls,
         anchor_index,
+        global_worker_cap,
         shutdown.load(Ordering::Acquire),
         abort.load(Ordering::Acquire),
         false,
@@ -2042,7 +2076,9 @@ where
         stage_index,
         stage: Arc::clone(&stages[stage_index].stage),
         input: links[stage_index].receiver.clone(),
+        input_stats: Arc::clone(&links[stage_index].stats),
         output,
+        output_stats: Arc::clone(&links[stage_index + 1].stats),
         output_acquire: stages[stage_index].output_acquire.clone(),
         retire: Arc::clone(&retire),
         shutdown: Arc::clone(shutdown),
@@ -2130,8 +2166,13 @@ fn run_assignment<E>(
                     duration_nanos_u64(wait_started.elapsed()),
                     Ordering::Relaxed,
                 );
+                assignment
+                    .input_stats
+                    .drains
+                    .fetch_add(1, Ordering::Relaxed);
                 let ctx = RuntimeStageContext {
                     output: assignment.output.clone(),
+                    output_stats: Arc::clone(&assignment.output_stats),
                     output_acquire: assignment.output_acquire.clone(),
                     shutdown: Arc::clone(&assignment.shutdown),
                     abort: Arc::clone(&assignment.abort),
@@ -2203,7 +2244,6 @@ fn drain_worker_events<E>(
     parked: &mut Vec<usize>,
     controls: &mut [StageControl],
     pending_scale: &mut Option<PendingScale>,
-    last_scale_completed: &mut Instant,
     abort: &Arc<AtomicBool>,
     stored_failure: &mut Option<PiperError<E>>,
 ) where
@@ -2220,6 +2260,8 @@ fn drain_worker_events<E>(
                     match pending.reason {
                         ScaleReason::Support => {
                             controls[pending.stage_index].settling = true;
+                            controls[pending.stage_index].settle_samples = 0;
+                            controls[pending.stage_index].settle_observed_work = false;
                             controls[pending.stage_index].scaling_state =
                                 StageScalingState::Settling;
                         }
@@ -2227,15 +2269,23 @@ fn drain_worker_events<E>(
                             if let Some(anchor) = controls[pending.stage_index].anchor.as_mut() {
                                 anchor.probe = Some(AnchorProbe {
                                     worker_id,
-                                    started_at: Instant::now(),
+                                    samples: 0,
+                                    observed_work: false,
                                 });
                             }
                             controls[pending.stage_index].scaling_state =
                                 StageScalingState::Probing;
                         }
-                        ScaleReason::AnchorRevert => {}
+                        ScaleReason::AnchorRevert
+                        | ScaleReason::BudgetPressure
+                        | ScaleReason::Idle => {
+                            controls[pending.stage_index].settling = true;
+                            controls[pending.stage_index].settle_samples = 0;
+                            controls[pending.stage_index].settle_observed_work = false;
+                            controls[pending.stage_index].scaling_state =
+                                StageScalingState::Settling;
+                        }
                     }
-                    *last_scale_completed = Instant::now();
                 }
             }
             WorkerEvent::Parked {
@@ -2252,21 +2302,35 @@ fn drain_worker_events<E>(
                     let pending = pending_scale.take().expect("pending scale exists");
                     record_stage_operation(controls, pending.stage_index, ScaleDirection::Remove);
                     if let Some(anchor) = controls[pending.stage_index].anchor.as_mut() {
-                        if pending.reason == ScaleReason::AnchorRevert {
+                        if matches!(
+                            pending.reason,
+                            ScaleReason::AnchorRevert
+                                | ScaleReason::BudgetPressure
+                                | ScaleReason::Idle
+                        ) {
                             anchor.probe = None;
                             anchor.last_probe_outcome = AnchorProbeOutcome::Reverted;
-                            anchor.probe_interval = grow_duration(anchor.probe_interval);
-                            anchor.next_probe_after = Instant::now() + anchor.probe_interval;
+                            if pending.reason == ScaleReason::BudgetPressure {
+                                anchor.last_probe_reason = AnchorProbeReason::BudgetPressure;
+                            } else if pending.reason == ScaleReason::Idle {
+                                anchor.last_probe_reason = AnchorProbeReason::Idle;
+                            }
+                            anchor.cooldown_samples = grow_sample_count(anchor.cooldown_samples);
                             controls[pending.stage_index].scaling_state =
                                 StageScalingState::BackingOff;
                         } else {
+                            controls[pending.stage_index].settling = true;
+                            controls[pending.stage_index].settle_samples = 0;
+                            controls[pending.stage_index].settle_observed_work = false;
                             controls[pending.stage_index].scaling_state =
-                                StageScalingState::Eligible;
+                                StageScalingState::Settling;
                         }
                     } else {
-                        controls[pending.stage_index].scaling_state = StageScalingState::Eligible;
+                        controls[pending.stage_index].settling = true;
+                        controls[pending.stage_index].settle_samples = 0;
+                        controls[pending.stage_index].settle_observed_work = false;
+                        controls[pending.stage_index].scaling_state = StageScalingState::Settling;
                     }
-                    *last_scale_completed = Instant::now();
                 }
             }
             WorkerEvent::Failed {
@@ -2286,7 +2350,6 @@ fn drain_worker_events<E>(
                     .is_some_and(|pending| pending.worker_id == worker_id)
                 {
                     *pending_scale = None;
-                    *last_scale_completed = Instant::now();
                 }
                 abort.store(true, Ordering::Release);
                 *stored_failure = Some(match failure {
@@ -2319,64 +2382,97 @@ fn record_stage_operation(
     stage_index: usize,
     direction: ScaleDirection,
 ) {
-    let now = Instant::now();
-    let control = &mut controls[stage_index];
-    if let Some((last_direction, last_at)) = control.last_operation {
-        if last_direction != direction
-            && now.duration_since(last_at) <= control.effective_remove_dwell
-        {
-            control.effective_add_dwell = grow_duration(control.effective_add_dwell);
-            control.effective_remove_dwell = grow_duration(control.effective_remove_dwell);
-        }
-    }
-    control.last_operation = Some((direction, now));
+    controls[stage_index].last_operation = Some((direction, Instant::now()));
 }
 
-fn grow_duration(duration: Duration) -> Duration {
-    let grown = duration.saturating_mul(2);
-    grown.min(Duration::from_secs(5))
-}
+const RATE_EWMA_ALPHA: f64 = 0.35;
+const SERVICE_EWMA_ALPHA: f64 = 0.30;
+const STABLE_RATE_RATIO: f64 = 0.12;
+const FAST_RATE_RATIO: f64 = 0.45;
+const RUNAWAY_RATE_RATIO: f64 = 0.85;
+const SETTLE_SAMPLES: u32 = 2;
+const PROBE_SETTLE_SAMPLES: u32 = 2;
+const IDLE_SHRINK_SAMPLES: u32 = 50;
+const DEFAULT_BACKLOG_DRAIN_SECS: f64 = 1.0;
 
-fn decay_duration(current: Duration, base: Duration) -> Duration {
-    if current <= base {
-        return current;
-    }
-    let current_nanos = duration_nanos_u64(current);
-    let base_nanos = duration_nanos_u64(base);
-    let decayed = base_nanos + ((current_nanos - base_nanos) * 9 / 10);
-    Duration::from_nanos(decayed.max(base_nanos))
-}
-
-fn sample_pressure(links: &[Link], config: &PiperConfig, pressure: &mut [PressureTimer]) {
-    let now = Instant::now();
+fn sample_links(links: &[Link], elapsed: Duration, controls: &mut [LinkControl]) {
+    let seconds = elapsed.as_secs_f64().max(0.000_001);
     for (index, link) in links.iter().enumerate() {
-        let state = WaterState::classify(link.receiver.len(), config.low_water, config.high_water);
-        let was_low = pressure[index].state.is_low_pressure();
-        let is_low = state.is_low_pressure();
+        let arrivals = link.stats.arrivals.load(Ordering::Relaxed);
+        let drains = link.stats.drains.load(Ordering::Relaxed);
+        let delta_arrivals = arrivals.saturating_sub(controls[index].last_arrivals);
+        let delta_drains = drains.saturating_sub(controls[index].last_drains);
+        let len = link.receiver.len();
+        let previous_len = controls[index].len;
+        let arrival_rate = delta_arrivals as f64 / seconds;
+        let drain_rate = delta_drains as f64 / seconds;
+        let net_rate = arrival_rate - drain_rate;
 
-        if is_low && (!was_low || pressure[index].low_since.is_none()) {
-            pressure[index].low_since = Some(now);
-        } else if !is_low {
-            pressure[index].low_since = None;
-        }
+        controls[index].last_arrivals = arrivals;
+        controls[index].last_drains = drains;
+        controls[index].previous_len = previous_len;
+        controls[index].len = len;
+        controls[index].arrival_rate =
+            ewma(controls[index].arrival_rate, arrival_rate, RATE_EWMA_ALPHA);
+        controls[index].drain_rate = ewma(controls[index].drain_rate, drain_rate, RATE_EWMA_ALPHA);
+        controls[index].net_rate = ewma(controls[index].net_rate, net_rate, RATE_EWMA_ALPHA);
+        controls[index].smoothed_len = ewma(controls[index].smoothed_len, len as f64, 0.25);
+        controls[index].trend = classify_queue_trend(
+            len,
+            previous_len,
+            controls[index].arrival_rate,
+            controls[index].drain_rate,
+            controls[index].net_rate,
+        );
+    }
+}
 
-        if state == WaterState::AboveHighWater
-            && (pressure[index].state != WaterState::AboveHighWater
-                || pressure[index].high_since.is_none())
-        {
-            pressure[index].high_since = Some(now);
-        } else if state != WaterState::AboveHighWater {
-            pressure[index].high_since = None;
-        }
+fn ewma(previous: f64, sample: f64, alpha: f64) -> f64 {
+    if previous == 0.0 {
+        sample
+    } else {
+        (previous * (1.0 - alpha)) + (sample * alpha)
+    }
+}
 
-        pressure[index].state = state;
+fn classify_queue_trend(
+    len: usize,
+    previous_len: usize,
+    arrival_rate: f64,
+    drain_rate: f64,
+    net_rate: f64,
+) -> QueueTrend {
+    let total_rate = arrival_rate + drain_rate;
+    if len == 0 && total_rate < 0.01 {
+        return QueueTrend::Starved;
+    }
+    if len == 0 && previous_len == 0 {
+        return QueueTrend::Stable;
+    }
+
+    let basis = arrival_rate.max(drain_rate).max(1.0);
+    let ratio = net_rate / basis;
+    let length_delta = len as isize - previous_len as isize;
+
+    if ratio <= -FAST_RATE_RATIO {
+        QueueTrend::FastDraining
+    } else if ratio <= -STABLE_RATE_RATIO {
+        QueueTrend::Draining
+    } else if ratio >= RUNAWAY_RATE_RATIO && length_delta > 0 {
+        QueueTrend::Runaway
+    } else if ratio >= FAST_RATE_RATIO {
+        QueueTrend::FastGrowing
+    } else if ratio >= STABLE_RATE_RATIO || length_delta > 2 {
+        QueueTrend::Growing
+    } else {
+        QueueTrend::Stable
     }
 }
 
 fn collect_stage_samples<E>(
     workers: &[WorkerSlot<E>],
     active_by_stage: &[Vec<usize>],
-    pressure: &[PressureTimer],
+    links: &[LinkControl],
     controls: &mut [StageControl],
 ) where
     E: Debug + Display + Send + 'static,
@@ -2401,35 +2497,48 @@ fn collect_stage_samples<E>(
             control.busy_ratio = sample.process_nanos as f64 / total_nanos as f64;
         }
 
-        let input_healthy = !pressure[stage_index].state.is_low_pressure();
-        let output_unblocked = pressure.get(stage_index + 1).map_or(true, |pressure| {
-            pressure.state != WaterState::AboveHighWater
-        });
-        if input_healthy && output_unblocked && total_nanos > 0 {
-            update_busy_ceiling(control);
+        if sample.processed_items > 0 && sample.process_nanos > 0 {
+            let service_time = sample.process_nanos as f64 / sample.processed_items as f64;
+            control.service_time_ewma =
+                ewma(control.service_time_ewma, service_time, SERVICE_EWMA_ALPHA);
+            control.per_worker_throughput = 1_000_000_000.0 / control.service_time_ewma.max(1.0);
         }
 
-        if control.settling && sample.processed_items > 0 {
-            control.settling = false;
-            control.scaling_state = StageScalingState::Eligible;
+        if sample.processed_items > 0 || links[stage_index].trend != QueueTrend::Starved {
+            control.idle_samples = 0;
+        } else if control.busy_ratio < 0.05 {
+            control.idle_samples = control.idle_samples.saturating_add(1);
         }
 
-        if !control.settling
-            && !matches!(
-                control.scaling_state,
-                StageScalingState::Probing | StageScalingState::BackingOff
-            )
-        {
-            control.effective_add_dwell =
-                decay_duration(control.effective_add_dwell, control.base_add_dwell);
-            control.effective_remove_dwell =
-                decay_duration(control.effective_remove_dwell, control.base_remove_dwell);
+        if control.settling {
+            control.settle_samples = control.settle_samples.saturating_add(1);
+            control.settle_observed_work |= sample.processed_items > 0;
+            if control.settle_samples >= SETTLE_SAMPLES
+                && (control.settle_observed_work || control.idle_samples >= IDLE_SHRINK_SAMPLES)
+            {
+                control.settling = false;
+                control.scaling_state = StageScalingState::Eligible;
+            }
         }
 
+        let input_available = links[stage_index].trend != QueueTrend::Starved;
+        let output_unblocked = links
+            .get(stage_index + 1)
+            .is_none_or(|link| !link.trend.is_growing());
         if let Some(anchor) = control.anchor.as_mut() {
+            if let Some(probe) = anchor.probe.as_mut() {
+                probe.samples = probe.samples.saturating_add(1);
+                probe.observed_work |= sample.processed_items > 0;
+            } else if anchor.cooldown_samples > 0 {
+                anchor.cooldown_samples -= 1;
+                if anchor.cooldown_samples == 0 {
+                    control.scaling_state = StageScalingState::Eligible;
+                }
+            }
+
             if !anchor.warmup_complete
                 && sample.processed_items > 0
-                && input_healthy
+                && input_available
                 && output_unblocked
             {
                 anchor.warmup_complete = true;
@@ -2439,14 +2548,28 @@ fn collect_stage_samples<E>(
     }
 }
 
-fn update_busy_ceiling(control: &mut StageControl) {
-    let busy = control.busy_ratio.clamp(0.0, 1.0);
-    if busy > control.busy_ceiling {
-        control.busy_ceiling = (control.busy_ceiling * 0.7) + (busy * 0.3);
-    } else if control.busy_ceiling > 0.0 {
-        control.busy_ceiling = (control.busy_ceiling * 0.995).max(busy);
-    } else {
-        control.busy_ceiling = busy;
+fn update_desired_workers(
+    links: &[LinkControl],
+    active_by_stage: &[Vec<usize>],
+    controls: &mut [StageControl],
+) {
+    for stage_index in 0..controls.len() {
+        let active = active_by_stage[stage_index].len().max(1);
+        let input = &links[stage_index];
+        let throughput = controls[stage_index].per_worker_throughput;
+        let desired = if throughput > 0.0 {
+            let mut required_rate = input.arrival_rate.max(0.0);
+            if input.trend.is_growing() {
+                required_rate += input.net_rate.max(0.0);
+                required_rate += input.len as f64 / DEFAULT_BACKLOG_DRAIN_SECS;
+            }
+            (required_rate / throughput).ceil().max(1.0) as usize
+        } else if input.trend.is_growing() {
+            active.saturating_add(1)
+        } else {
+            active
+        };
+        controls[stage_index].desired_workers = desired.max(1);
     }
 }
 
@@ -2463,48 +2586,88 @@ enum ScaleOperation {
 }
 
 fn choose_scale_operation(
-    pressure: &[PressureTimer],
+    links: &[LinkControl],
     active_by_stage: &[Vec<usize>],
     controls: &mut [StageControl],
     anchor_index: usize,
+    global_worker_cap: usize,
 ) -> Option<ScaleOperation> {
-    let now = Instant::now();
-
-    if let Some(operation) = choose_anchor_probe_operation(pressure, controls, anchor_index, now) {
+    if let Some(operation) = choose_support_operation(
+        links,
+        active_by_stage,
+        controls,
+        anchor_index,
+        global_worker_cap,
+    ) {
         return Some(operation);
     }
 
-    if let Some(operation) =
-        choose_support_operation(pressure, active_by_stage, controls, anchor_index, now)
-    {
+    if let Some(operation) = choose_anchor_probe_operation(
+        links,
+        active_by_stage,
+        controls,
+        anchor_index,
+        global_worker_cap,
+    ) {
         return Some(operation);
     }
 
-    choose_anchor_operation(pressure, active_by_stage, controls, anchor_index, now)
+    if let Some(operation) = choose_anchor_operation(
+        links,
+        active_by_stage,
+        controls,
+        anchor_index,
+        global_worker_cap,
+    ) {
+        return Some(operation);
+    }
+
+    choose_idle_operation(links, active_by_stage, controls, anchor_index)
 }
 
 fn choose_anchor_probe_operation(
-    pressure: &[PressureTimer],
+    links: &[LinkControl],
+    active_by_stage: &[Vec<usize>],
     controls: &mut [StageControl],
     anchor_index: usize,
-    now: Instant,
+    global_worker_cap: usize,
 ) -> Option<ScaleOperation> {
-    let control = &mut controls[anchor_index];
-    let Some(anchor) = control.anchor.as_mut() else {
+    if controls.iter().any(|control| control.settling) {
         return None;
-    };
+    }
+
+    let control = &mut controls[anchor_index];
+    let anchor = control.anchor.as_mut()?;
 
     if let Some(probe) = anchor.probe.as_ref() {
-        if now.duration_since(probe.started_at) < anchor.probe_window {
+        if probe.samples < PROBE_SETTLE_SAMPLES || !probe.observed_work {
             return None;
         }
 
-        let input_low = pressure[anchor_index].state.is_low_pressure();
-        let output_high = pressure[anchor_index + 1].state == WaterState::AboveHighWater;
-        let too_idle =
-            control.busy_ceiling > 0.0 && control.busy_ratio < control.busy_ceiling * 0.55;
+        let output_backpressure = links.last().is_some_and(|link| link.trend.is_growing());
+        let input_underfed =
+            link_underfeeds_stage(&links[anchor_index], active_by_stage[anchor_index].len());
+        let output_unstable = links[anchor_index + 1].trend.is_growing();
+        let budget_pressure = active_worker_count(active_by_stage) >= global_worker_cap
+            && active_by_stage[anchor_index].len() > 1;
+        let too_idle = control.busy_ratio < 0.45 && !links[anchor_index].trend.is_growing();
 
-        if input_low || output_high || too_idle {
+        let revert_reason = if output_backpressure {
+            Some(AnchorProbeReason::OutputBackpressure)
+        } else if budget_pressure {
+            Some(AnchorProbeReason::BudgetPressure)
+        } else if input_underfed {
+            Some(AnchorProbeReason::InputUnderfed)
+        } else if output_unstable {
+            Some(AnchorProbeReason::SupportUnstable)
+        } else if too_idle {
+            Some(AnchorProbeReason::Idle)
+        } else {
+            None
+        };
+
+        if let Some(reason) = revert_reason {
+            anchor.last_probe_reason = reason;
             return Some(ScaleOperation::Remove {
                 stage_index: anchor_index,
                 worker_id: Some(probe.worker_id),
@@ -2514,8 +2677,8 @@ fn choose_anchor_probe_operation(
 
         anchor.probe = None;
         anchor.last_probe_outcome = AnchorProbeOutcome::Kept;
-        anchor.probe_interval = shrink_duration(anchor.probe_interval);
-        anchor.next_probe_after = now + anchor.probe_interval;
+        anchor.last_probe_reason = AnchorProbeReason::None;
+        anchor.cooldown_samples = 2;
         control.scaling_state = StageScalingState::Eligible;
     }
 
@@ -2523,70 +2686,82 @@ fn choose_anchor_probe_operation(
 }
 
 fn choose_support_operation(
-    pressure: &[PressureTimer],
+    links: &[LinkControl],
     active_by_stage: &[Vec<usize>],
     controls: &mut [StageControl],
     anchor_index: usize,
-    now: Instant,
+    global_worker_cap: usize,
 ) -> Option<ScaleOperation> {
-    for link_index in (1..=anchor_index).rev() {
-        if low_elapsed(
-            pressure[link_index],
-            now,
-            controls[link_index - 1].effective_add_dwell,
-        ) {
-            for stage_index in (0..link_index).rev() {
-                if stage_index == anchor_index {
-                    continue;
-                }
-                if support_can_add(stage_index, pressure, controls) {
-                    return Some(ScaleOperation::Add {
-                        stage_index,
-                        reason: ScaleReason::Support,
-                    });
-                }
-            }
-        }
-    }
-
-    for stage_index in anchor_index + 1..active_by_stage.len() {
-        if high_elapsed(
-            pressure[stage_index],
-            now,
-            controls[stage_index].effective_add_dwell,
-        ) && support_can_add(stage_index, pressure, controls)
-        {
-            return Some(ScaleOperation::Add {
-                stage_index,
-                reason: ScaleReason::Support,
+    if links.last().is_some_and(|link| link.trend.is_growing()) {
+        if active_by_stage[anchor_index].len() > 1 && stage_can_scale(&controls[anchor_index]) {
+            set_anchor_reason(
+                controls,
+                anchor_index,
+                AnchorProbeReason::OutputBackpressure,
+            );
+            return Some(ScaleOperation::Remove {
+                stage_index: anchor_index,
+                worker_id: None,
+                reason: ScaleReason::AnchorRevert,
             });
         }
+        return None;
     }
 
-    for stage_index in 0..active_by_stage.len() {
-        if stage_index == anchor_index {
+    for link_index in 0..links.len().saturating_sub(1) {
+        if !links[link_index].trend.is_growing() {
             continue;
         }
+        let consumer_stage = link_index;
+        if consumer_stage >= controls.len() {
+            continue;
+        }
+        if consumer_stage == anchor_index {
+            continue;
+        }
+        if active_by_stage[consumer_stage].len() < controls[consumer_stage].desired_workers
+            && support_can_add(consumer_stage, controls)
+        {
+            return add_or_rebalance_for_stage(
+                consumer_stage,
+                active_by_stage,
+                controls,
+                anchor_index,
+                global_worker_cap,
+            );
+        }
+    }
 
-        let remove_pressure = if stage_index < anchor_index {
-            high_elapsed(
-                pressure[stage_index + 1],
-                now,
-                controls[stage_index].effective_remove_dwell,
-            ) && !pressure[stage_index].state.is_low_pressure()
-        } else {
-            low_elapsed(
-                pressure[stage_index],
-                now,
-                controls[stage_index].effective_remove_dwell,
-            )
-        };
-
-        if remove_pressure && active_by_stage[stage_index].len() > 1 {
+    let anchor_input = &links[anchor_index];
+    if link_underfeeds_stage(anchor_input, active_by_stage[anchor_index].len())
+        && controls[anchor_index].busy_ratio > 0.60
+        && active_by_stage[anchor_index].len() > 1
+    {
+        for stage_index in (0..anchor_index).rev() {
+            if links[stage_index].trend == QueueTrend::Starved {
+                continue;
+            }
+            if support_can_add(stage_index, controls)
+                && active_by_stage[stage_index].len()
+                    < controls[stage_index]
+                        .desired_workers
+                        .max(active_by_stage[stage_index].len() + 1)
+            {
+                return add_or_rebalance_for_stage(
+                    stage_index,
+                    active_by_stage,
+                    controls,
+                    anchor_index,
+                    global_worker_cap,
+                );
+            }
+        }
+        if stage_can_scale(&controls[anchor_index]) {
+            set_anchor_reason(controls, anchor_index, AnchorProbeReason::InputUnderfed);
             return Some(ScaleOperation::Remove {
-                stage_index,
+                stage_index: anchor_index,
                 worker_id: None,
-                reason: ScaleReason::Support,
+                reason: ScaleReason::AnchorRevert,
             });
         }
     }
@@ -2595,38 +2770,25 @@ fn choose_support_operation(
 }
 
 fn choose_anchor_operation(
-    pressure: &[PressureTimer],
+    links: &[LinkControl],
     active_by_stage: &[Vec<usize>],
     controls: &mut [StageControl],
     anchor_index: usize,
-    now: Instant,
+    global_worker_cap: usize,
 ) -> Option<ScaleOperation> {
     let control = &mut controls[anchor_index];
-    let Some(anchor) = control.anchor.as_mut() else {
-        return None;
-    };
+    let anchor = control.anchor.as_mut()?;
 
     if anchor.probe.is_some() {
         return None;
     }
 
-    if now < anchor.next_probe_after {
+    if anchor.cooldown_samples > 0 {
         control.scaling_state = StageScalingState::BackingOff;
         return None;
     }
 
     let active = active_by_stage[anchor_index].len();
-    if active > 1
-        && (low_elapsed(pressure[anchor_index], now, anchor.remove_dwell)
-            || high_elapsed(pressure[anchor_index + 1], now, anchor.remove_dwell))
-    {
-        return Some(ScaleOperation::Remove {
-            stage_index: anchor_index,
-            worker_id: None,
-            reason: ScaleReason::Support,
-        });
-    }
-
     if active >= anchor.max_threads {
         control.scaling_state = StageScalingState::Eligible;
         return None;
@@ -2637,13 +2799,13 @@ fn choose_anchor_operation(
         return None;
     }
 
-    let input_ready = !pressure[anchor_index].state.is_low_pressure();
-    let downstream_ready = pressure[anchor_index + 1].state != WaterState::AboveHighWater;
-    let enough_busy_signal = control.busy_ceiling <= 0.0
-        || control.busy_ratio >= (control.busy_ceiling * 0.8)
-        || pressure[anchor_index].state == WaterState::AboveHighWater;
+    let has_budget = active_worker_count(active_by_stage) < global_worker_cap;
+    let input_ready = !link_underfeeds_stage(&links[anchor_index], active);
+    let downstream_ready = !links[anchor_index + 1].trend.is_growing()
+        && links.last().is_none_or(|link| !link.trend.is_growing());
+    let enough_busy_signal = control.busy_ratio >= 0.70 || links[anchor_index].trend.is_growing();
 
-    if input_ready && downstream_ready && enough_busy_signal {
+    if has_budget && input_ready && downstream_ready && enough_busy_signal {
         return Some(ScaleOperation::Add {
             stage_index: anchor_index,
             reason: ScaleReason::AnchorProbe,
@@ -2654,37 +2816,102 @@ fn choose_anchor_operation(
     None
 }
 
-fn support_can_add(
-    stage_index: usize,
-    pressure: &[PressureTimer],
-    controls: &[StageControl],
-) -> bool {
-    if controls[stage_index].settling
-        || matches!(
-            controls[stage_index].scaling_state,
+fn choose_idle_operation(
+    links: &[LinkControl],
+    active_by_stage: &[Vec<usize>],
+    controls: &mut [StageControl],
+    anchor_index: usize,
+) -> Option<ScaleOperation> {
+    for stage_index in 0..controls.len() {
+        if active_by_stage[stage_index].len() <= 1 || !stage_can_scale(&controls[stage_index]) {
+            continue;
+        }
+        if stage_index != anchor_index
+            && active_by_stage[stage_index].len() > controls[stage_index].desired_workers.max(1)
+            && !links[stage_index].trend.is_growing()
+        {
+            return Some(ScaleOperation::Remove {
+                stage_index,
+                worker_id: None,
+                reason: ScaleReason::Support,
+            });
+        }
+        if controls[stage_index].idle_samples >= IDLE_SHRINK_SAMPLES {
+            if stage_index == anchor_index {
+                set_anchor_reason(controls, anchor_index, AnchorProbeReason::Idle);
+            }
+            return Some(ScaleOperation::Remove {
+                stage_index,
+                worker_id: None,
+                reason: ScaleReason::Idle,
+            });
+        }
+    }
+    None
+}
+
+fn support_can_add(stage_index: usize, controls: &[StageControl]) -> bool {
+    stage_can_scale(&controls[stage_index])
+}
+
+fn link_underfeeds_stage(link: &LinkControl, active_threads: usize) -> bool {
+    link.trend == QueueTrend::Starved
+        || (link.trend.is_draining() && link.len <= active_threads.saturating_mul(2).max(1))
+}
+
+fn stage_can_scale(control: &StageControl) -> bool {
+    !control.settling
+        && !matches!(
+            control.scaling_state,
             StageScalingState::Settling | StageScalingState::Probing
         )
-    {
-        return false;
+}
+
+fn add_or_rebalance_for_stage(
+    stage_index: usize,
+    active_by_stage: &[Vec<usize>],
+    controls: &mut [StageControl],
+    anchor_index: usize,
+    global_worker_cap: usize,
+) -> Option<ScaleOperation> {
+    if active_worker_count(active_by_stage) < global_worker_cap {
+        return Some(ScaleOperation::Add {
+            stage_index,
+            reason: ScaleReason::Support,
+        });
     }
-    !pressure[stage_index].state.is_low_pressure()
+
+    if stage_index != anchor_index
+        && active_by_stage[anchor_index].len() > 1
+        && stage_can_scale(&controls[anchor_index])
+    {
+        set_anchor_reason(controls, anchor_index, AnchorProbeReason::BudgetPressure);
+        return Some(ScaleOperation::Remove {
+            stage_index: anchor_index,
+            worker_id: None,
+            reason: ScaleReason::BudgetPressure,
+        });
+    }
+
+    None
 }
 
-fn shrink_duration(duration: Duration) -> Duration {
-    let nanos = duration_nanos_u64(duration);
-    Duration::from_nanos((nanos * 3 / 4).max(10_000_000))
+fn active_worker_count(active_by_stage: &[Vec<usize>]) -> usize {
+    active_by_stage.iter().map(Vec::len).sum()
 }
 
-fn low_elapsed(pressure: PressureTimer, now: Instant, dwell: Duration) -> bool {
-    pressure
-        .low_since
-        .is_some_and(|since| now.duration_since(since) >= dwell)
+fn set_anchor_reason(
+    controls: &mut [StageControl],
+    anchor_index: usize,
+    reason: AnchorProbeReason,
+) {
+    if let Some(anchor) = controls[anchor_index].anchor.as_mut() {
+        anchor.last_probe_reason = reason;
+    }
 }
 
-fn high_elapsed(pressure: PressureTimer, now: Instant, dwell: Duration) -> bool {
-    pressure
-        .high_since
-        .is_some_and(|since| now.duration_since(since) >= dwell)
+fn grow_sample_count(current: u32) -> u32 {
+    current.saturating_mul(2).max(4).min(64)
 }
 
 fn duration_nanos_u64(duration: Duration) -> u64 {
@@ -2698,7 +2925,7 @@ fn anchor_probe_state(anchor: &AnchorControl, active_threads: usize) -> AnchorPr
         AnchorProbeState::Probing
     } else if active_threads >= anchor.max_threads {
         AnchorProbeState::AtMax
-    } else if Instant::now() < anchor.next_probe_after {
+    } else if anchor.cooldown_samples > 0 {
         AnchorProbeState::BackingOff
     } else {
         AnchorProbeState::Eligible
@@ -2712,9 +2939,10 @@ fn update_snapshot<E>(
     stages: &[RuntimeStage<E>],
     active_by_stage: &[Vec<usize>],
     parked_threads: usize,
-    pressure: &[PressureTimer],
+    link_controls: &[LinkControl],
     controls: &[StageControl],
     anchor_index: usize,
+    global_worker_cap: usize,
     shutdown_requested: bool,
     abort_requested: bool,
     pending_scale_operation: bool,
@@ -2722,13 +2950,17 @@ fn update_snapshot<E>(
     E: Debug + Display + Send + 'static,
 {
     let mut snapshot = snapshot.write();
-    snapshot.links = links
+    snapshot.links = link_controls
         .iter()
         .enumerate()
-        .map(|(index, link)| LinkSnapshot {
+        .map(|(index, control)| LinkSnapshot {
             index,
-            len: link.receiver.len(),
-            state: pressure[index].state,
+            len: links[index].receiver.len(),
+            trend: control.trend,
+            arrival_rate: control.arrival_rate,
+            drain_rate: control.drain_rate,
+            net_rate: control.net_rate,
+            smoothed_len: control.smoothed_len,
         })
         .collect();
     snapshot.stages = stages
@@ -2740,9 +2972,14 @@ fn update_snapshot<E>(
             active_threads: active_by_stage[index].len(),
             processed_count: controls[index].processed_count,
             busy_ratio: controls[index].busy_ratio,
-            busy_ceiling: controls[index].busy_ceiling,
-            effective_add_dwell: controls[index].effective_add_dwell,
-            effective_remove_dwell: controls[index].effective_remove_dwell,
+            service_time: Duration::from_nanos(
+                controls[index]
+                    .service_time_ewma
+                    .max(0.0)
+                    .min(u64::MAX as f64) as u64,
+            ),
+            per_worker_throughput: controls[index].per_worker_throughput,
+            desired_workers: controls[index].desired_workers,
             scaling_state: controls[index].scaling_state,
             is_anchor: controls[index].anchor.is_some(),
         })
@@ -2754,11 +2991,17 @@ fn update_snapshot<E>(
             active_threads: active_by_stage[anchor_index].len(),
             max_threads: anchor.max_threads,
             probe_state: anchor_probe_state(anchor, active_by_stage[anchor_index].len()),
-            effective_probe_interval: anchor.probe_interval,
             last_probe_outcome: anchor.last_probe_outcome,
+            last_probe_reason: anchor.last_probe_reason,
         };
     }
     snapshot.parked_threads = parked_threads;
+    snapshot.total_active_workers = active_worker_count(active_by_stage);
+    snapshot.global_worker_cap = global_worker_cap;
+    snapshot.budget_pressure = snapshot.total_active_workers >= global_worker_cap;
+    snapshot.output_backpressure = link_controls
+        .last()
+        .is_some_and(|control| control.trend.is_growing());
     snapshot.shutdown_requested = shutdown_requested;
     snapshot.abort_requested = abort_requested;
     snapshot.pending_scale_operation = pending_scale_operation;
@@ -2788,27 +3031,24 @@ mod tests {
         PiperConfig {
             sample_interval: Duration::from_millis(1),
             poll_interval: Duration::from_millis(1),
-            scale_cooldown: Duration::ZERO,
-            add_dwell: Duration::from_millis(5),
-            remove_dwell: Duration::from_millis(5),
-            low_water: 2,
-            high_water: 4,
+            global_worker_cap: Some(8),
             csv_telemetry: None,
         }
     }
 
     fn support_control() -> StageControl {
         StageControl {
-            base_add_dwell: Duration::from_millis(5),
-            base_remove_dwell: Duration::from_millis(5),
-            effective_add_dwell: Duration::from_millis(5),
-            effective_remove_dwell: Duration::from_millis(5),
             processed_count: 0,
             busy_ratio: 0.0,
-            busy_ceiling: 0.0,
+            service_time_ewma: 1_000_000.0,
+            per_worker_throughput: 1_000.0,
+            desired_workers: 1,
             last_sample_processed: 0,
             scaling_state: StageScalingState::Eligible,
             settling: false,
+            settle_samples: 0,
+            settle_observed_work: false,
+            idle_samples: 0,
             last_operation: None,
             anchor: None,
         }
@@ -2818,165 +3058,210 @@ mod tests {
         StageControl {
             anchor: Some(AnchorControl {
                 max_threads,
-                probe_interval: Duration::from_millis(10),
-                probe_window: Duration::from_millis(10),
-                remove_dwell: Duration::from_millis(5),
                 warmup_complete: true,
                 probe: None,
-                next_probe_after: Instant::now() - Duration::from_millis(1),
+                cooldown_samples: 0,
                 last_probe_outcome: AnchorProbeOutcome::None,
+                last_probe_reason: AnchorProbeReason::None,
             }),
             busy_ratio: 0.8,
-            busy_ceiling: 0.8,
+            desired_workers: max_threads,
             ..support_control()
         }
     }
 
-    #[test]
-    fn water_state_classification_keeps_starved_and_low_distinct() {
-        assert_eq!(WaterState::classify(0, 2, 4), WaterState::Starved);
-        assert_eq!(WaterState::classify(1, 2, 4), WaterState::BelowLowWater);
-        assert_eq!(WaterState::classify(2, 2, 4), WaterState::Nominal);
-        assert_eq!(WaterState::classify(5, 2, 4), WaterState::AboveHighWater);
-        assert!(WaterState::Starved.is_low_pressure());
-        assert!(WaterState::BelowLowWater.is_low_pressure());
+    fn link(trend: QueueTrend) -> LinkControl {
+        LinkControl {
+            trend,
+            len: if trend.is_growing() { 8 } else { 0 },
+            previous_len: 4,
+            arrival_rate: if trend.is_growing() { 100.0 } else { 10.0 },
+            drain_rate: if trend.is_draining() { 100.0 } else { 10.0 },
+            net_rate: if trend.is_growing() {
+                90.0
+            } else if trend.is_draining() {
+                -90.0
+            } else {
+                0.0
+            },
+            ..LinkControl::default()
+        }
     }
 
     #[test]
-    fn starved_and_below_low_share_the_low_dwell_timer() {
-        let config = test_config();
+    fn queue_trend_classification_distinguishes_stable_empty_from_starved() {
+        assert_eq!(
+            classify_queue_trend(0, 0, 0.0, 0.0, 0.0),
+            QueueTrend::Starved
+        );
+        assert_eq!(
+            classify_queue_trend(0, 0, 100.0, 100.0, 0.0),
+            QueueTrend::Stable
+        );
+        assert_eq!(
+            classify_queue_trend(20, 10, 100.0, 10.0, 90.0),
+            QueueTrend::Runaway
+        );
+        assert_eq!(
+            classify_queue_trend(2, 20, 10.0, 100.0, -90.0),
+            QueueTrend::FastDraining
+        );
+    }
+
+    #[test]
+    fn link_sampling_tracks_rates_and_numeric_trends() {
         let (sender, receiver) = kanal::unbounded::<Message>();
         let links = vec![Link {
             sender: Some(sender.clone()),
             receiver,
+            stats: Arc::new(LinkStats::default()),
         }];
-        let mut pressure = vec![PressureTimer::default()];
+        let mut controls = vec![LinkControl::default()];
 
-        sample_pressure(&links, &config, &mut pressure);
-        let low_started = pressure[0].low_since.expect("starved starts low timer");
+        for _ in 0..10 {
+            sender.send(Box::new(1_u8)).unwrap();
+            links[0].stats.arrivals.fetch_add(1, Ordering::Relaxed);
+        }
+        sample_links(&links, Duration::from_secs(1), &mut controls);
 
-        sender.send(Box::new(1_u8)).unwrap();
-        sample_pressure(&links, &config, &mut pressure);
-
-        assert_eq!(pressure[0].state, WaterState::BelowLowWater);
-        assert_eq!(pressure[0].low_since, Some(low_started));
+        assert_eq!(controls[0].arrival_rate, 10.0);
+        assert_eq!(controls[0].drain_rate, 0.0);
+        assert!(controls[0].trend.is_growing());
+        assert_eq!(QueueTrend::Runaway.code(), 6);
     }
 
     #[test]
-    fn support_add_skips_starved_upstream_stages() {
-        let config = test_config();
-        let elapsed = Instant::now() - config.add_dwell - Duration::from_millis(1);
-        let active = vec![vec![0], vec![1], vec![2]];
-        let mut pressure = vec![
-            PressureTimer {
-                state: WaterState::Starved,
-                low_since: Some(elapsed),
-                high_since: None,
-            },
-            PressureTimer {
-                state: WaterState::Starved,
-                low_since: Some(elapsed),
-                high_since: None,
-            },
-            PressureTimer {
-                state: WaterState::BelowLowWater,
-                low_since: Some(elapsed),
-                high_since: None,
-            },
-            PressureTimer::default(),
-        ];
-        let mut controls = vec![support_control(), support_control(), anchor_control(1)];
-
-        assert!(choose_scale_operation(&pressure, &active, &mut controls, 2).is_none());
-
-        pressure[0].state = WaterState::Nominal;
-        pressure[0].low_since = None;
-        assert!(matches!(
-            choose_scale_operation(&pressure, &active, &mut controls, 2),
-            Some(ScaleOperation::Add {
-                stage_index: 0,
-                reason: ScaleReason::Support
-            })
-        ));
-    }
-
-    #[test]
-    fn post_anchor_scaling_uses_local_input_pressure() {
-        let config = test_config();
-        let elapsed = Instant::now() - config.add_dwell - Duration::from_millis(1);
+    fn growing_internal_link_adds_consumer() {
         let active = vec![vec![0], vec![1]];
-        let pressure = vec![
-            PressureTimer {
-                state: WaterState::Nominal,
-                low_since: None,
-                high_since: None,
-            },
-            PressureTimer {
-                state: WaterState::AboveHighWater,
-                low_since: None,
-                high_since: Some(elapsed),
-            },
-            PressureTimer::default(),
+        let links = vec![
+            link(QueueTrend::Stable),
+            link(QueueTrend::Growing),
+            link(QueueTrend::Stable),
         ];
         let mut controls = vec![anchor_control(1), support_control()];
+        controls[1].desired_workers = 2;
 
         assert!(matches!(
-            choose_scale_operation(&pressure, &active, &mut controls, 0),
+            choose_scale_operation(&links, &active, &mut controls, 0, 4),
             Some(ScaleOperation::Add {
                 stage_index: 1,
                 reason: ScaleReason::Support
             })
         ));
+    }
 
-        let active = vec![vec![0], vec![1, 2]];
-        let elapsed = Instant::now() - config.remove_dwell - Duration::from_millis(1);
-        let pressure = vec![
-            PressureTimer {
-                state: WaterState::Nominal,
-                low_since: None,
-                high_since: None,
-            },
-            PressureTimer {
-                state: WaterState::BelowLowWater,
-                low_since: Some(elapsed),
-                high_since: None,
-            },
-            PressureTimer::default(),
+    #[test]
+    fn draining_anchor_input_adds_nearest_upstream_producer() {
+        let active = vec![vec![0], vec![1], vec![2, 3]];
+        let links = vec![
+            link(QueueTrend::Stable),
+            link(QueueTrend::Stable),
+            link(QueueTrend::Draining),
+            link(QueueTrend::Stable),
         ];
-        let mut controls = vec![anchor_control(1), support_control()];
+        let mut controls = vec![support_control(), support_control(), anchor_control(4)];
+        controls[1].desired_workers = 2;
 
         assert!(matches!(
-            choose_scale_operation(&pressure, &active, &mut controls, 0),
-            Some(ScaleOperation::Remove {
+            choose_scale_operation(&links, &active, &mut controls, 2, 6),
+            Some(ScaleOperation::Add {
                 stage_index: 1,
-                reason: ScaleReason::Support,
+                reason: ScaleReason::Support
+            })
+        ));
+    }
+
+    #[test]
+    fn unsuppliable_anchor_input_reduces_anchor() {
+        let active = vec![vec![0], vec![1], vec![2, 3]];
+        let links = vec![
+            link(QueueTrend::Starved),
+            link(QueueTrend::Starved),
+            link(QueueTrend::Draining),
+            link(QueueTrend::Stable),
+        ];
+        let mut controls = vec![support_control(), support_control(), anchor_control(4)];
+
+        assert!(matches!(
+            choose_scale_operation(&links, &active, &mut controls, 2, 6),
+            Some(ScaleOperation::Remove {
+                stage_index: 2,
+                reason: ScaleReason::AnchorRevert,
+                ..
+            })
+        ));
+        assert_eq!(
+            controls[2].anchor.as_ref().unwrap().last_probe_reason,
+            AnchorProbeReason::InputUnderfed
+        );
+    }
+
+    #[test]
+    fn global_cap_full_reduces_anchor_before_support_growth() {
+        let active = vec![vec![0, 1], vec![2]];
+        let links = vec![
+            link(QueueTrend::Stable),
+            link(QueueTrend::Growing),
+            link(QueueTrend::Stable),
+        ];
+        let mut controls = vec![anchor_control(4), support_control()];
+        controls[1].desired_workers = 2;
+
+        assert!(matches!(
+            choose_scale_operation(&links, &active, &mut controls, 0, 3),
+            Some(ScaleOperation::Remove {
+                stage_index: 0,
+                reason: ScaleReason::BudgetPressure,
                 ..
             })
         ));
     }
 
     #[test]
-    fn anchor_scales_up_after_warmup_when_busy_and_fed() {
-        let active = vec![vec![0]];
-        let pressure = vec![
-            PressureTimer {
-                state: WaterState::Nominal,
-                low_since: None,
-                high_since: None,
-            },
-            PressureTimer {
-                state: WaterState::Nominal,
-                low_since: None,
-                high_since: None,
-            },
+    fn output_growth_sets_backpressure_and_blocks_anchor_scaling() {
+        let active = vec![vec![0, 1], vec![2]];
+        let links = vec![
+            link(QueueTrend::Stable),
+            link(QueueTrend::Stable),
+            link(QueueTrend::Growing),
         ];
-        let mut controls = vec![anchor_control(2)];
+        let mut controls = vec![anchor_control(4), support_control()];
 
         assert!(matches!(
-            choose_scale_operation(&pressure, &active, &mut controls, 0),
-            Some(ScaleOperation::Add {
+            choose_scale_operation(&links, &active, &mut controls, 0, 4),
+            Some(ScaleOperation::Remove {
                 stage_index: 0,
-                reason: ScaleReason::AnchorProbe
+                reason: ScaleReason::AnchorRevert,
+                ..
+            })
+        ));
+        assert_eq!(
+            controls[0].anchor.as_ref().unwrap().last_probe_reason,
+            AnchorProbeReason::OutputBackpressure
+        );
+    }
+
+    #[test]
+    fn delayed_idle_shrink_preserves_short_gaps_then_removes_one() {
+        let active = vec![vec![0], vec![1, 2]];
+        let links = vec![
+            link(QueueTrend::Stable),
+            link(QueueTrend::Starved),
+            link(QueueTrend::Stable),
+        ];
+        let mut controls = vec![anchor_control(1), support_control()];
+        controls[1].desired_workers = 2;
+        controls[1].idle_samples = IDLE_SHRINK_SAMPLES - 1;
+
+        assert!(choose_idle_operation(&links, &active, &mut controls, 0).is_none());
+
+        controls[1].idle_samples = IDLE_SHRINK_SAMPLES;
+        assert!(matches!(
+            choose_idle_operation(&links, &active, &mut controls, 0),
+            Some(ScaleOperation::Remove {
+                stage_index: 1,
+                reason: ScaleReason::Idle,
+                ..
             })
         ));
     }

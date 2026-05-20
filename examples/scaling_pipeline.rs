@@ -1,6 +1,6 @@
 use piper::{
-    BufferLease, CsvTelemetryConfig, PiperConfig, PiperSnapshot, Stage, StageContext, StageExt,
-    WaterState, anchor, pipeline,
+    BufferLease, CsvTelemetryConfig, PiperConfig, PiperSnapshot, QueueTrend, Stage, StageContext,
+    StageExt, anchor, pipeline,
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -11,6 +11,8 @@ const BATCH_SIZE: usize = 2_048;
 const COMPUTE_ROUNDS: usize = 12_288;
 const EMIT_ROUNDS: usize = 24_576;
 const TELEMETRY_INTERVAL: Duration = Duration::from_millis(100);
+const MANAGER_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
+const CSV_TELEMETRY_INTERVAL: Duration = MANAGER_SAMPLE_INTERVAL;
 
 type Batch = Vec<u64>;
 type BatchLease = BufferLease<Vec<u64>>;
@@ -158,9 +160,6 @@ pipeline! {
             anchor(Compute)
                 .max_threads(4)
                 .initial_threads(2)
-                .probe_interval(Duration::from_millis(100))
-                .probe_window(Duration::from_millis(250))
-                .remove_dwell(Duration::from_millis(500))
                 .with_reusable_output(|| Vec::<u64>::with_capacity(BATCH_SIZE)),
             Emit,
         ];
@@ -169,20 +168,19 @@ pipeline! {
 
 fn config() -> PiperConfig {
     PiperConfig {
-        sample_interval: Duration::from_millis(10),
+        sample_interval: MANAGER_SAMPLE_INTERVAL,
         poll_interval: Duration::from_millis(5),
-        scale_cooldown: Duration::from_millis(20),
-        add_dwell: Duration::from_millis(40),
-        remove_dwell: Duration::from_millis(500),
-        low_water: 2,
-        high_water: 24,
-        csv_telemetry: Some(CsvTelemetryConfig::new(format!(
-            "piper_{}.csv",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-        ))),
+        global_worker_cap: Some(16),
+        csv_telemetry: Some(
+            CsvTelemetryConfig::new(format!(
+                "piper_{}.csv",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            ))
+            .interval(CSV_TELEMETRY_INTERVAL),
+        ),
     }
 }
 
@@ -250,18 +248,23 @@ fn main() -> piper::Result<(), ExampleError> {
 
 fn print_telemetry(elapsed: Duration, telemetry: &PiperSnapshot, received_batches: usize) {
     println!(
-        "\n[{:>5.2}s] rx={received_batches}/{BATCH_COUNT} | parked={} | pending={} | anchor={} {}/{} {:?}",
+        "\n[{:>5.2}s] rx={received_batches}/{BATCH_COUNT} | workers={}/{} | parked={} | pending={} | budget_pressure={} | out_pressure={} | anchor={} {}/{} {:?} {:?}",
         elapsed.as_secs_f64(),
+        telemetry.total_active_workers,
+        telemetry.global_worker_cap,
         telemetry.parked_threads,
         telemetry.pending_scale_operation,
+        telemetry.budget_pressure,
+        telemetry.output_backpressure,
         telemetry.anchor.stage_name,
         telemetry.anchor.active_threads,
         telemetry.anchor.max_threads,
         telemetry.anchor.probe_state,
+        telemetry.anchor.last_probe_reason,
     );
     println!(
-        "  {:<11} {:>3}  {:<34} {:<34} {:>5}  scale",
-        "stage", "w", "input", "output", "busy"
+        "  {:<11} {:>3} {:>3}  {:<43} {:<43} {:>5} {:>10}  scale",
+        "stage", "w", "want", "input", "output", "busy", "job/ms"
     );
 
     for index in 0..telemetry.stages.len() {
@@ -276,12 +279,14 @@ fn stage_summary(index: usize, telemetry: &PiperSnapshot) -> String {
     let name = format!("{}{}", stage.name, marker);
 
     format!(
-        "{:<11} {:>3}  {:<34} {:<34} {:>4.0}%  {:?}",
+        "{:<11} {:>3} {:>3}  {:<43} {:<43} {:>4.0}% {:>10.3}  {:?}",
         name,
         stage.active_threads,
+        stage.desired_workers,
         queue_status(index, telemetry),
         queue_status(index + 1, telemetry),
         busy,
+        stage.per_worker_throughput / 1000.0,
         stage.scaling_state,
     )
 }
@@ -289,10 +294,12 @@ fn stage_summary(index: usize, telemetry: &PiperSnapshot) -> String {
 fn queue_status(index: usize, telemetry: &PiperSnapshot) -> String {
     let link = &telemetry.links[index];
     format!(
-        "{} {}/{}",
+        "{} len={} trend={}({}) net={:+.1}/s",
         queue_label(index, telemetry),
         link.len,
-        water_label_for_queue(index, link.state, telemetry)
+        trend_label_for_queue(index, link.trend, telemetry),
+        link.trend.code(),
+        link.net_rate,
     )
 }
 
@@ -310,19 +317,22 @@ fn queue_label(index: usize, telemetry: &PiperSnapshot) -> String {
     }
 }
 
-fn water_label_for_queue(
+fn trend_label_for_queue(
     index: usize,
-    state: WaterState,
+    trend: QueueTrend,
     telemetry: &PiperSnapshot,
 ) -> &'static str {
-    if index + 1 == telemetry.links.len() && state == WaterState::Starved {
+    if index + 1 == telemetry.links.len() && trend == QueueTrend::Starved {
         return "empty";
     }
 
-    match state {
-        WaterState::Starved => "starved",
-        WaterState::BelowLowWater => "low",
-        WaterState::Nominal => "ok",
-        WaterState::AboveHighWater => "high",
+    match trend {
+        QueueTrend::Starved => "starved",
+        QueueTrend::FastDraining => "fast-drain",
+        QueueTrend::Draining => "drain",
+        QueueTrend::Stable => "stable",
+        QueueTrend::Growing => "grow",
+        QueueTrend::FastGrowing => "fast-grow",
+        QueueTrend::Runaway => "runaway",
     }
 }

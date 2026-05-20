@@ -81,11 +81,7 @@ fn config() -> PiperConfig {
     PiperConfig {
         sample_interval: Duration::from_millis(5),
         poll_interval: Duration::from_millis(5),
-        scale_cooldown: Duration::from_millis(10),
-        add_dwell: Duration::from_millis(20),
-        remove_dwell: Duration::from_millis(100),
-        low_water: 1,
-        high_water: 8,
+        global_worker_cap: Some(6),
         csv_telemetry: None,
     }
 }
