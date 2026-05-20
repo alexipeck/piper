@@ -1,9 +1,12 @@
 use parking_lot::RwLock;
 use std::any::Any;
 use std::fmt::{Debug, Display};
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
 use std::marker::PhantomData;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -27,8 +30,11 @@ pub enum PiperError<E: Debug + Display = String> {
     #[error("Piper requires at least one stage")]
     NoStages,
 
-    #[error("compute_stage index {compute_stage} is out of range for {stages} stages")]
-    InvalidComputeStage { compute_stage: usize, stages: usize },
+    #[error("Piper requires exactly one anchor stage, found {count}")]
+    InvalidAnchorCount { count: usize },
+
+    #[error("anchor thread count must be greater than 0")]
+    InvalidAnchorThreads,
 
     #[error("failed to spawn worker thread `{worker}`")]
     SpawnFailed {
@@ -54,6 +60,9 @@ pub enum PiperError<E: Debug + Display = String> {
 
     #[error("internal Piper failure in worker `{worker}`: {message}")]
     Internal { worker: String, message: String },
+
+    #[error("Piper telemetry failure: {message}")]
+    Telemetry { message: String },
 }
 
 #[derive(Clone)]
@@ -189,8 +198,7 @@ pub struct PiperConfig {
     pub remove_dwell: Duration,
     pub low_water: usize,
     pub high_water: usize,
-    pub compute_stage: usize,
-    pub compute_threads: usize,
+    pub csv_telemetry: Option<CsvTelemetryConfig>,
 }
 
 impl Default for PiperConfig {
@@ -203,9 +211,28 @@ impl Default for PiperConfig {
             remove_dwell: Duration::from_millis(250),
             low_water: 1,
             high_water: 64,
-            compute_stage: 0,
-            compute_threads: 1,
+            csv_telemetry: None,
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CsvTelemetryConfig {
+    pub path: PathBuf,
+    pub interval: Duration,
+}
+
+impl CsvTelemetryConfig {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            interval: Duration::from_millis(250),
+        }
+    }
+
+    pub fn interval(mut self, interval: Duration) -> Self {
+        self.interval = interval;
+        self
     }
 }
 
@@ -247,12 +274,55 @@ pub struct StageSnapshot {
     pub index: usize,
     pub name: String,
     pub active_threads: usize,
+    pub processed_count: u64,
+    pub busy_ratio: f64,
+    pub busy_ceiling: f64,
+    pub effective_add_dwell: Duration,
+    pub effective_remove_dwell: Duration,
+    pub scaling_state: StageScalingState,
+    pub is_anchor: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StageScalingState {
+    Eligible,
+    Settling,
+    Probing,
+    BackingOff,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AnchorProbeState {
+    WarmingUp,
+    Eligible,
+    Probing,
+    BackingOff,
+    AtMax,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AnchorProbeOutcome {
+    None,
+    Kept,
+    Reverted,
+}
+
+#[derive(Clone, Debug)]
+pub struct AnchorSnapshot {
+    pub stage_index: usize,
+    pub stage_name: String,
+    pub active_threads: usize,
+    pub max_threads: usize,
+    pub probe_state: AnchorProbeState,
+    pub effective_probe_interval: Duration,
+    pub last_probe_outcome: AnchorProbeOutcome,
 }
 
 #[derive(Clone, Debug)]
 pub struct PiperSnapshot {
     pub links: Vec<LinkSnapshot>,
     pub stages: Vec<StageSnapshot>,
+    pub anchor: AnchorSnapshot,
     pub parked_threads: usize,
     pub shutdown_requested: bool,
     pub abort_requested: bool,
@@ -467,9 +537,7 @@ where
     fn internal_failure(&self, message: impl Into<String>) -> std::result::Result<(), ()> {
         self.runtime
             .internal_failure
-            .send(InternalFailure {
-                message: message.into(),
-            })
+            .send(InternalFailure::internal(message))
             .map_err(|_| ())
     }
 }
@@ -498,9 +566,9 @@ where
             && !self.abort.load(Ordering::Acquire)
         {
             self.abort.store(true, Ordering::Release);
-            let _ = self.internal_failure.send(InternalFailure {
-                message: "stage output channel closed unexpectedly".to_string(),
-            });
+            let _ = self.internal_failure.send(InternalFailure::internal(
+                "stage output channel closed unexpectedly",
+            ));
         }
     }
 
@@ -694,6 +762,8 @@ where
     name: String,
     stage: Arc<dyn DynStage<E>>,
     output_acquire_builder: Option<Arc<dyn OutputAcquireBuilder + Send + Sync>>,
+    anchor: Option<AnchorHints>,
+    dwell_hints: StageDwellHints,
 }
 
 impl<E> StageSpec<E>
@@ -711,6 +781,72 @@ where
         }));
         self
     }
+
+    pub fn with_dwell(mut self, add: Duration, remove: Duration) -> Self {
+        self.dwell_hints.add = Some(add);
+        self.dwell_hints.remove = Some(remove);
+        self
+    }
+
+    pub fn with_add_dwell(mut self, add: Duration) -> Self {
+        self.dwell_hints.add = Some(add);
+        self
+    }
+
+    pub fn with_remove_dwell(mut self, remove: Duration) -> Self {
+        self.dwell_hints.remove = Some(remove);
+        self
+    }
+
+    pub fn max_threads(mut self, max_threads: usize) -> Self {
+        self.anchor
+            .get_or_insert_with(AnchorHints::default)
+            .max_threads = Some(max_threads);
+        self
+    }
+
+    pub fn initial_threads(mut self, initial_threads: usize) -> Self {
+        self.anchor
+            .get_or_insert_with(AnchorHints::default)
+            .initial_threads = Some(initial_threads);
+        self
+    }
+
+    pub fn probe_interval(mut self, interval: Duration) -> Self {
+        self.anchor
+            .get_or_insert_with(AnchorHints::default)
+            .probe_interval = Some(interval);
+        self
+    }
+
+    pub fn probe_window(mut self, window: Duration) -> Self {
+        self.anchor
+            .get_or_insert_with(AnchorHints::default)
+            .probe_window = Some(window);
+        self
+    }
+
+    pub fn remove_dwell(mut self, dwell: Duration) -> Self {
+        self.anchor
+            .get_or_insert_with(AnchorHints::default)
+            .remove_dwell = Some(dwell);
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StageDwellHints {
+    add: Option<Duration>,
+    remove: Option<Duration>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AnchorHints {
+    max_threads: Option<usize>,
+    initial_threads: Option<usize>,
+    probe_interval: Option<Duration>,
+    probe_window: Option<Duration>,
+    remove_dwell: Option<Duration>,
 }
 
 pub trait IntoStageSpec<E>
@@ -746,6 +882,18 @@ pub trait StageExt: Stage + Sized {
     {
         stage(default_stage_name::<Self>(), self).with_reusable_output(factory)
     }
+
+    fn with_dwell(self, add: Duration, remove: Duration) -> StageSpec<Self::Error> {
+        stage(default_stage_name::<Self>(), self).with_dwell(add, remove)
+    }
+
+    fn with_add_dwell(self, add: Duration) -> StageSpec<Self::Error> {
+        stage(default_stage_name::<Self>(), self).with_add_dwell(add)
+    }
+
+    fn with_remove_dwell(self, remove: Duration) -> StageSpec<Self::Error> {
+        stage(default_stage_name::<Self>(), self).with_remove_dwell(remove)
+    }
 }
 
 impl<S> StageExt for S where S: Stage {}
@@ -758,7 +906,19 @@ where
         name: name.into(),
         stage: Arc::new(StageAdapter { stage: stage_impl }),
         output_acquire_builder: None,
+        anchor: None,
+        dwell_hints: StageDwellHints::default(),
     }
+}
+
+pub fn anchor<S, E>(stage_like: S) -> StageSpec<E>
+where
+    S: IntoStageSpec<E>,
+    E: Debug + Display + Send + 'static,
+{
+    let mut spec = stage_like.into_stage_spec();
+    spec.anchor = Some(spec.anchor.unwrap_or_default());
+    spec
 }
 
 fn default_stage_name<S>() -> String {
@@ -923,8 +1083,23 @@ enum StageFailure<E> {
 }
 
 #[derive(Clone, Debug)]
-struct InternalFailure {
-    message: String,
+enum InternalFailure {
+    Internal { message: String },
+    Telemetry { message: String },
+}
+
+impl InternalFailure {
+    fn internal(message: impl Into<String>) -> Self {
+        InternalFailure::Internal {
+            message: message.into(),
+        }
+    }
+
+    fn telemetry(message: impl Into<String>) -> Self {
+        InternalFailure::Telemetry {
+            message: message.into(),
+        }
+    }
 }
 
 struct Link {
@@ -940,6 +1115,17 @@ where
     name: String,
     stage: Arc<dyn DynStage<E>>,
     output_acquire: Option<DynAcquire>,
+    anchor: Option<ResolvedAnchor>,
+    dwell_hints: StageDwellHints,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResolvedAnchor {
+    max_threads: usize,
+    initial_threads: usize,
+    probe_interval: Duration,
+    probe_window: Duration,
+    remove_dwell: Duration,
 }
 
 enum WorkerCommand<E>
@@ -964,6 +1150,7 @@ where
     abort: Arc<AtomicBool>,
     poll_interval: Duration,
     internal_failure: kanal::Sender<InternalFailure>,
+    stats: Arc<WorkerStats>,
 }
 
 enum WorkerEvent<E>
@@ -995,11 +1182,42 @@ where
     handle: Option<JoinHandle<()>>,
     active_stage: Option<usize>,
     retire: Option<Arc<AtomicBool>>,
+    stats: Arc<WorkerStats>,
 }
 
-enum PendingScale {
-    Add { worker_id: usize },
-    Remove { worker_id: usize },
+#[derive(Default)]
+struct WorkerStats {
+    process_nanos: AtomicU64,
+    wait_nanos: AtomicU64,
+    processed_items: AtomicU64,
+}
+
+impl WorkerStats {
+    fn reset(&self) {
+        self.process_nanos.store(0, Ordering::Relaxed);
+        self.wait_nanos.store(0, Ordering::Relaxed);
+        self.processed_items.store(0, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScaleDirection {
+    Add,
+    Remove,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScaleReason {
+    Support,
+    AnchorProbe,
+    AnchorRevert,
+}
+
+struct PendingScale {
+    worker_id: usize,
+    stage_index: usize,
+    direction: ScaleDirection,
+    reason: ScaleReason,
 }
 
 #[derive(Clone, Copy)]
@@ -1017,6 +1235,109 @@ impl Default for PressureTimer {
             high_since: None,
         }
     }
+}
+
+struct StageControl {
+    base_add_dwell: Duration,
+    base_remove_dwell: Duration,
+    effective_add_dwell: Duration,
+    effective_remove_dwell: Duration,
+    processed_count: u64,
+    busy_ratio: f64,
+    busy_ceiling: f64,
+    last_sample_processed: u64,
+    scaling_state: StageScalingState,
+    settling: bool,
+    last_operation: Option<(ScaleDirection, Instant)>,
+    anchor: Option<AnchorControl>,
+}
+
+struct AnchorControl {
+    max_threads: usize,
+    probe_interval: Duration,
+    probe_window: Duration,
+    remove_dwell: Duration,
+    warmup_complete: bool,
+    probe: Option<AnchorProbe>,
+    next_probe_after: Instant,
+    last_probe_outcome: AnchorProbeOutcome,
+}
+
+struct AnchorProbe {
+    worker_id: usize,
+    started_at: Instant,
+}
+
+#[derive(Default)]
+struct StageSample {
+    process_nanos: u64,
+    wait_nanos: u64,
+    processed_items: u64,
+}
+
+fn resolve_anchor_hints<E>(hints: AnchorHints) -> Result<ResolvedAnchor, E>
+where
+    E: Debug + Display + Send + 'static,
+{
+    let available = thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .max(1);
+    let max_threads = hints.max_threads.unwrap_or(available);
+    if max_threads == 0 {
+        return Err(PiperError::InvalidAnchorThreads);
+    }
+    let initial_threads = hints
+        .initial_threads
+        .unwrap_or_else(|| max_threads.div_ceil(2).max(1));
+    if initial_threads == 0 {
+        return Err(PiperError::InvalidAnchorThreads);
+    }
+
+    Ok(ResolvedAnchor {
+        max_threads,
+        initial_threads: initial_threads.min(max_threads),
+        probe_interval: hints.probe_interval.unwrap_or(Duration::from_millis(100)),
+        probe_window: hints.probe_window.unwrap_or(Duration::from_millis(250)),
+        remove_dwell: hints.remove_dwell.unwrap_or(Duration::from_millis(500)),
+    })
+}
+
+fn build_stage_controls<E>(config: &PiperConfig, stages: &[RuntimeStage<E>]) -> Vec<StageControl>
+where
+    E: Debug + Display + Send + 'static,
+{
+    let now = Instant::now();
+    stages
+        .iter()
+        .map(|stage| {
+            let base_add_dwell = stage.dwell_hints.add.unwrap_or(config.add_dwell);
+            let base_remove_dwell = stage.dwell_hints.remove.unwrap_or(config.remove_dwell);
+            StageControl {
+                base_add_dwell,
+                base_remove_dwell,
+                effective_add_dwell: base_add_dwell,
+                effective_remove_dwell: base_remove_dwell,
+                processed_count: 0,
+                busy_ratio: 0.0,
+                busy_ceiling: 0.0,
+                last_sample_processed: 0,
+                scaling_state: StageScalingState::Eligible,
+                settling: false,
+                last_operation: None,
+                anchor: stage.anchor.map(|anchor| AnchorControl {
+                    max_threads: anchor.max_threads,
+                    probe_interval: anchor.probe_interval,
+                    probe_window: anchor.probe_window,
+                    remove_dwell: anchor.remove_dwell,
+                    warmup_complete: false,
+                    probe: None,
+                    next_probe_after: now,
+                    last_probe_outcome: AnchorProbeOutcome::None,
+                }),
+            }
+        })
+        .collect()
 }
 
 pub struct Piper<In, Out, E = String>
@@ -1043,13 +1364,10 @@ where
         if stages.is_empty() {
             return Err(PiperError::NoStages);
         }
-        if config.compute_threads == 0 {
-            return Err(PiperError::ZeroWorkers);
-        }
-        if config.compute_stage >= stages.len() {
-            return Err(PiperError::InvalidComputeStage {
-                compute_stage: config.compute_stage,
-                stages: stages.len(),
+        let anchor_count = stages.iter().filter(|stage| stage.anchor.is_some()).count();
+        if anchor_count != 1 {
+            return Err(PiperError::InvalidAnchorCount {
+                count: anchor_count,
             });
         }
 
@@ -1080,14 +1398,27 @@ where
 
         let runtime_stages: Vec<_> = stages
             .into_iter()
-            .map(|stage| RuntimeStage {
-                name: stage.name,
-                stage: stage.stage,
-                output_acquire: stage
-                    .output_acquire_builder
-                    .map(|builder| builder.build(lease_runtime.clone())),
+            .map(|stage| {
+                let anchor = stage.anchor.map(resolve_anchor_hints).transpose()?;
+                Ok(RuntimeStage {
+                    name: stage.name,
+                    stage: stage.stage,
+                    output_acquire: stage
+                        .output_acquire_builder
+                        .map(|builder| builder.build(lease_runtime.clone())),
+                    anchor,
+                    dwell_hints: stage.dwell_hints,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, E>>()?;
+
+        let anchor_index = runtime_stages
+            .iter()
+            .position(|stage| stage.anchor.is_some())
+            .expect("validated exactly one anchor");
+        let anchor_stage = runtime_stages[anchor_index]
+            .anchor
+            .expect("validated exactly one anchor");
 
         let snapshot = Arc::new(RwLock::new(PiperSnapshot {
             links: (0..=runtime_stages.len())
@@ -1104,13 +1435,36 @@ where
                     index,
                     name: stage.name.clone(),
                     active_threads: 0,
+                    processed_count: 0,
+                    busy_ratio: 0.0,
+                    busy_ceiling: 0.0,
+                    effective_add_dwell: stage.dwell_hints.add.unwrap_or(config.add_dwell),
+                    effective_remove_dwell: stage.dwell_hints.remove.unwrap_or(config.remove_dwell),
+                    scaling_state: StageScalingState::Eligible,
+                    is_anchor: stage.anchor.is_some(),
                 })
                 .collect(),
+            anchor: AnchorSnapshot {
+                stage_index: anchor_index,
+                stage_name: runtime_stages[anchor_index].name.clone(),
+                active_threads: 0,
+                max_threads: anchor_stage.max_threads,
+                probe_state: AnchorProbeState::WarmingUp,
+                effective_probe_interval: anchor_stage.probe_interval,
+                last_probe_outcome: AnchorProbeOutcome::None,
+            },
             parked_threads: 0,
             shutdown_requested: false,
             abort_requested: false,
             pending_scale_operation: false,
         }));
+
+        let csv_recorder = start_csv_recorder(
+            config.csv_telemetry.clone(),
+            Arc::clone(&snapshot),
+            internal_failure_sender.clone(),
+            Arc::clone(&abort),
+        )?;
 
         let supervisor_snapshot = Arc::clone(&snapshot);
         let supervisor_shutdown = Arc::clone(&shutdown);
@@ -1127,6 +1481,7 @@ where
                     supervisor_snapshot,
                     internal_failure_sender,
                     internal_failure_receiver,
+                    csv_recorder,
                 )
             })
             .map_err(|source| PiperError::SpawnFailed {
@@ -1186,6 +1541,192 @@ where
     }
 }
 
+struct CsvRecorder {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+impl CsvRecorder {
+    fn stop<E>(self) -> Result<(), E>
+    where
+        E: Debug + Display + Send + 'static,
+    {
+        self.stop.store(true, Ordering::Release);
+        self.handle
+            .join()
+            .map_err(|payload| PiperError::WorkerPanicked {
+                worker: "piper-csv-telemetry".to_string(),
+                message: panic_payload_to_string(payload),
+            })
+    }
+}
+
+fn start_csv_recorder<E>(
+    config: Option<CsvTelemetryConfig>,
+    snapshot: Arc<RwLock<PiperSnapshot>>,
+    failure_sender: kanal::Sender<InternalFailure>,
+    abort: Arc<AtomicBool>,
+) -> Result<Option<CsvRecorder>, E>
+where
+    E: Debug + Display + Send + 'static,
+{
+    let Some(config) = config else {
+        return Ok(None);
+    };
+
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&config.path)
+        .map_err(|source| PiperError::Telemetry {
+            message: format!(
+                "failed to create CSV telemetry file `{}`: {source}",
+                config.path.display()
+            ),
+        })?;
+    let mut writer = BufWriter::new(file);
+    let initial_snapshot = snapshot.read().clone();
+    writeln!(writer, "{}", csv_header(&initial_snapshot)).map_err(|source| {
+        PiperError::Telemetry {
+            message: format!(
+                "failed to write CSV telemetry header `{}`: {source}",
+                config.path.display()
+            ),
+        }
+    })?;
+    writer.flush().map_err(|source| PiperError::Telemetry {
+        message: format!(
+            "failed to flush CSV telemetry header `{}`: {source}",
+            config.path.display()
+        ),
+    })?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let path = config.path.clone();
+    let handle = thread::Builder::new()
+        .name("piper-csv-telemetry".to_string())
+        .spawn(move || {
+            let started = Instant::now();
+            loop {
+                thread::sleep(config.interval);
+                let stopping = thread_stop.load(Ordering::Acquire) || abort.load(Ordering::Acquire);
+                let snapshot = snapshot.read().clone();
+                if let Err(source) = writeln!(writer, "{}", csv_row(started.elapsed(), &snapshot))
+                    .and_then(|_| writer.flush())
+                {
+                    abort.store(true, Ordering::Release);
+                    let _ = failure_sender.send(InternalFailure::telemetry(format!(
+                        "failed to write CSV telemetry file `{}`: {source}",
+                        path.display()
+                    )));
+                    break;
+                }
+                if stopping {
+                    break;
+                }
+            }
+        })
+        .map_err(|source| PiperError::SpawnFailed {
+            worker: "piper-csv-telemetry".to_string(),
+            source,
+        })?;
+
+    Ok(Some(CsvRecorder { stop, handle }))
+}
+
+fn csv_header(snapshot: &PiperSnapshot) -> String {
+    let mut fields = vec![
+        "elapsed_ms".to_string(),
+        "shutdown_requested".to_string(),
+        "abort_requested".to_string(),
+        "pending_scale_operation".to_string(),
+        "parked_threads".to_string(),
+        "anchor_index".to_string(),
+        "anchor_name".to_string(),
+        "anchor_active_threads".to_string(),
+        "anchor_max_threads".to_string(),
+        "anchor_probe_state".to_string(),
+        "anchor_effective_probe_interval_ms".to_string(),
+        "anchor_last_probe_outcome".to_string(),
+    ];
+
+    for link in &snapshot.links {
+        fields.push(format!("link{}_len", link.index));
+        fields.push(format!("link{}_state", link.index));
+    }
+
+    for stage in &snapshot.stages {
+        fields.push(format!("stage{}_name", stage.index));
+        fields.push(format!("stage{}_active_threads", stage.index));
+        fields.push(format!("stage{}_processed_count", stage.index));
+        fields.push(format!("stage{}_busy_ratio", stage.index));
+        fields.push(format!("stage{}_busy_ceiling", stage.index));
+        fields.push(format!("stage{}_effective_add_dwell_ms", stage.index));
+        fields.push(format!("stage{}_effective_remove_dwell_ms", stage.index));
+        fields.push(format!("stage{}_scaling_state", stage.index));
+        fields.push(format!("stage{}_is_anchor", stage.index));
+    }
+
+    fields.join(",")
+}
+
+fn csv_row(elapsed: Duration, snapshot: &PiperSnapshot) -> String {
+    let mut fields = vec![
+        format!("{:.3}", elapsed.as_secs_f64() * 1000.0),
+        snapshot.shutdown_requested.to_string(),
+        snapshot.abort_requested.to_string(),
+        snapshot.pending_scale_operation.to_string(),
+        snapshot.parked_threads.to_string(),
+        snapshot.anchor.stage_index.to_string(),
+        csv_escape(&snapshot.anchor.stage_name),
+        snapshot.anchor.active_threads.to_string(),
+        snapshot.anchor.max_threads.to_string(),
+        format!("{:?}", snapshot.anchor.probe_state),
+        format!(
+            "{:.3}",
+            snapshot.anchor.effective_probe_interval.as_secs_f64() * 1000.0
+        ),
+        format!("{:?}", snapshot.anchor.last_probe_outcome),
+    ];
+
+    for link in &snapshot.links {
+        fields.push(link.len.to_string());
+        fields.push(format!("{:?}", link.state));
+    }
+
+    for stage in &snapshot.stages {
+        fields.push(csv_escape(&stage.name));
+        fields.push(stage.active_threads.to_string());
+        fields.push(stage.processed_count.to_string());
+        fields.push(format!("{:.6}", stage.busy_ratio));
+        fields.push(format!("{:.6}", stage.busy_ceiling));
+        fields.push(format!(
+            "{:.3}",
+            stage.effective_add_dwell.as_secs_f64() * 1000.0
+        ));
+        fields.push(format!(
+            "{:.3}",
+            stage.effective_remove_dwell.as_secs_f64() * 1000.0
+        ));
+        fields.push(format!("{:?}", stage.scaling_state));
+        fields.push(stage.is_anchor.to_string());
+    }
+
+    fields.join(",")
+}
+
+fn csv_escape(value: &str) -> String {
+    if value
+        .chars()
+        .any(|ch| matches!(ch, ',' | '"' | '\n' | '\r'))
+    {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 fn run_supervisor<E>(
     config: PiperConfig,
     stages: Vec<RuntimeStage<E>>,
@@ -1195,6 +1736,7 @@ fn run_supervisor<E>(
     snapshot: Arc<RwLock<PiperSnapshot>>,
     internal_failure_sender: kanal::Sender<InternalFailure>,
     internal_failure_receiver: kanal::Receiver<InternalFailure>,
+    mut csv_recorder: Option<CsvRecorder>,
 ) -> Result<(), E>
 where
     E: Debug + Display + Send + 'static,
@@ -1204,14 +1746,19 @@ where
     let mut active_by_stage = vec![Vec::<usize>::new(); stages.len()];
     let mut parked = Vec::new();
     let mut pressure = vec![PressureTimer::default(); links.len()];
+    let mut controls = build_stage_controls(&config, &stages);
+    let anchor_index = stages
+        .iter()
+        .position(|stage| stage.anchor.is_some())
+        .expect("validated exactly one anchor");
     let mut pending_scale = None;
     let mut last_scale_completed = Instant::now();
     let mut stored_failure = None;
     let mut supervisor_holds_links = true;
 
     for stage_index in 0..stages.len() {
-        let active_count = if stage_index == config.compute_stage {
-            config.compute_threads
+        let active_count = if let Some(anchor) = stages[stage_index].anchor {
+            anchor.initial_threads
         } else {
             1
         };
@@ -1246,6 +1793,8 @@ where
         &active_by_stage,
         parked.len(),
         &pressure,
+        &controls,
+        anchor_index,
         shutdown.load(Ordering::Acquire),
         abort.load(Ordering::Acquire),
         pending_scale.is_some(),
@@ -1257,6 +1806,7 @@ where
             &mut workers,
             &mut active_by_stage,
             &mut parked,
+            &mut controls,
             &mut pending_scale,
             &mut last_scale_completed,
             &abort,
@@ -1264,9 +1814,12 @@ where
         );
 
         while let Ok(Some(failure)) = internal_failure_receiver.try_recv() {
-            stored_failure = Some(PiperError::Internal {
-                worker: "piper-supervisor".to_string(),
-                message: failure.message,
+            stored_failure = Some(match failure {
+                InternalFailure::Internal { message } => PiperError::Internal {
+                    worker: "piper-supervisor".to_string(),
+                    message,
+                },
+                InternalFailure::Telemetry { message } => PiperError::Telemetry { message },
             });
             abort.store(true, Ordering::Release);
         }
@@ -1284,6 +1837,7 @@ where
         }
 
         sample_pressure(&links, &config, &mut pressure);
+        collect_stage_samples(&workers, &active_by_stage, &pressure, &mut controls);
 
         if !shutdown.load(Ordering::Acquire)
             && !abort.load(Ordering::Acquire)
@@ -1291,9 +1845,14 @@ where
             && pending_scale.is_none()
             && last_scale_completed.elapsed() >= config.scale_cooldown
         {
-            if let Some(operation) = choose_scale_operation(&config, &pressure, &active_by_stage) {
+            if let Some(operation) =
+                choose_scale_operation(&pressure, &active_by_stage, &mut controls, anchor_index)
+            {
                 match operation {
-                    ScaleOperation::Add(stage_index) => {
+                    ScaleOperation::Add {
+                        stage_index,
+                        reason,
+                    } => {
                         let worker_id = match parked.pop() {
                             Some(worker_id) => worker_id,
                             None => {
@@ -1313,7 +1872,12 @@ where
                             &mut workers,
                             &mut active_by_stage,
                         )?;
-                        pending_scale = Some(PendingScale::Add { worker_id });
+                        pending_scale = Some(PendingScale {
+                            worker_id,
+                            stage_index,
+                            direction: ScaleDirection::Add,
+                            reason,
+                        });
 
                         while parked.len() < stages.len() {
                             let name = format!("piper-worker-{}", workers.len());
@@ -1322,11 +1886,22 @@ where
                             parked.push(worker_id);
                         }
                     }
-                    ScaleOperation::Remove(stage_index) => {
-                        if let Some(worker_id) = active_by_stage[stage_index].first().copied() {
+                    ScaleOperation::Remove {
+                        stage_index,
+                        worker_id,
+                        reason,
+                    } => {
+                        if let Some(worker_id) =
+                            worker_id.or_else(|| active_by_stage[stage_index].first().copied())
+                        {
                             if let Some(retire) = workers[worker_id].retire.as_ref() {
                                 retire.store(true, Ordering::Release);
-                                pending_scale = Some(PendingScale::Remove { worker_id });
+                                pending_scale = Some(PendingScale {
+                                    worker_id,
+                                    stage_index,
+                                    direction: ScaleDirection::Remove,
+                                    reason,
+                                });
                             }
                         }
                     }
@@ -1341,6 +1916,8 @@ where
             &active_by_stage,
             parked.len(),
             &pressure,
+            &controls,
+            anchor_index,
             shutdown.load(Ordering::Acquire),
             abort.load(Ordering::Acquire),
             pending_scale.is_some(),
@@ -1380,10 +1957,16 @@ where
         &active_by_stage,
         0,
         &pressure,
+        &controls,
+        anchor_index,
         shutdown.load(Ordering::Acquire),
         abort.load(Ordering::Acquire),
         false,
     );
+
+    if let Some(recorder) = csv_recorder.take() {
+        recorder.stop()?;
+    }
 
     if let Some(failure) = stored_failure {
         Err(failure)
@@ -1424,6 +2007,7 @@ where
         handle: Some(handle),
         active_stage: None,
         retire: None,
+        stats: Arc::new(WorkerStats::default()),
     });
     Ok(worker_id)
 }
@@ -1445,6 +2029,7 @@ where
     E: Debug + Display + Send + 'static,
 {
     let retire = Arc::new(AtomicBool::new(false));
+    workers[worker_id].stats.reset();
     let output = links[stage_index + 1]
         .sender
         .as_ref()
@@ -1464,6 +2049,7 @@ where
         abort: Arc::clone(abort),
         poll_interval: config.poll_interval,
         internal_failure: internal_failure.clone(),
+        stats: Arc::clone(&workers[worker_id].stats),
     };
     workers[worker_id].active_stage = Some(stage_index);
     workers[worker_id].retire = Some(retire);
@@ -1537,8 +2123,13 @@ fn run_assignment<E>(
             break;
         }
 
+        let wait_started = Instant::now();
         match assignment.input.recv_timeout(assignment.poll_interval) {
             Ok(input) => {
+                assignment.stats.wait_nanos.fetch_add(
+                    duration_nanos_u64(wait_started.elapsed()),
+                    Ordering::Relaxed,
+                );
                 let ctx = RuntimeStageContext {
                     output: assignment.output.clone(),
                     output_acquire: assignment.output_acquire.clone(),
@@ -1546,7 +2137,13 @@ fn run_assignment<E>(
                     abort: Arc::clone(&assignment.abort),
                     internal_failure: assignment.internal_failure.clone(),
                 };
-                if let Err(failure) = assignment.stage.process_box(state.as_mut(), input, ctx) {
+                let process_started = Instant::now();
+                let result = assignment.stage.process_box(state.as_mut(), input, ctx);
+                assignment.stats.process_nanos.fetch_add(
+                    duration_nanos_u64(process_started.elapsed()),
+                    Ordering::Relaxed,
+                );
+                if let Err(failure) = result {
                     let _ = event_sender.send(WorkerEvent::Failed {
                         worker_id,
                         stage_index,
@@ -1555,14 +2152,28 @@ fn run_assignment<E>(
                     });
                     return;
                 }
+                assignment
+                    .stats
+                    .processed_items
+                    .fetch_add(1, Ordering::Relaxed);
             }
             Err(kanal::ReceiveErrorTimeout::Timeout) => {
+                assignment.stats.wait_nanos.fetch_add(
+                    duration_nanos_u64(wait_started.elapsed()),
+                    Ordering::Relaxed,
+                );
                 if assignment.input.is_terminated() {
                     break;
                 }
             }
             Err(kanal::ReceiveErrorTimeout::Closed)
-            | Err(kanal::ReceiveErrorTimeout::SendClosed) => break,
+            | Err(kanal::ReceiveErrorTimeout::SendClosed) => {
+                assignment.stats.wait_nanos.fetch_add(
+                    duration_nanos_u64(wait_started.elapsed()),
+                    Ordering::Relaxed,
+                );
+                break;
+            }
         }
     }
 
@@ -1590,6 +2201,7 @@ fn drain_worker_events<E>(
     workers: &mut [WorkerSlot<E>],
     active_by_stage: &mut [Vec<usize>],
     parked: &mut Vec<usize>,
+    controls: &mut [StageControl],
     pending_scale: &mut Option<PendingScale>,
     last_scale_completed: &mut Instant,
     abort: &Arc<AtomicBool>,
@@ -1600,9 +2212,29 @@ fn drain_worker_events<E>(
     while let Ok(Some(event)) = receiver.try_recv() {
         match event {
             WorkerEvent::Started { worker_id, .. } => {
-                if matches!(pending_scale, Some(PendingScale::Add { worker_id: id }) if *id == worker_id)
-                {
-                    *pending_scale = None;
+                if pending_scale.as_ref().is_some_and(|pending| {
+                    pending.worker_id == worker_id && pending.direction == ScaleDirection::Add
+                }) {
+                    let pending = pending_scale.take().expect("pending scale exists");
+                    record_stage_operation(controls, pending.stage_index, ScaleDirection::Add);
+                    match pending.reason {
+                        ScaleReason::Support => {
+                            controls[pending.stage_index].settling = true;
+                            controls[pending.stage_index].scaling_state =
+                                StageScalingState::Settling;
+                        }
+                        ScaleReason::AnchorProbe => {
+                            if let Some(anchor) = controls[pending.stage_index].anchor.as_mut() {
+                                anchor.probe = Some(AnchorProbe {
+                                    worker_id,
+                                    started_at: Instant::now(),
+                                });
+                            }
+                            controls[pending.stage_index].scaling_state =
+                                StageScalingState::Probing;
+                        }
+                        ScaleReason::AnchorRevert => {}
+                    }
                     *last_scale_completed = Instant::now();
                 }
             }
@@ -1614,9 +2246,26 @@ fn drain_worker_events<E>(
                 workers[worker_id].active_stage = None;
                 workers[worker_id].retire = None;
                 parked.push(worker_id);
-                if matches!(pending_scale, Some(PendingScale::Remove { worker_id: id }) if *id == worker_id)
-                {
-                    *pending_scale = None;
+                if pending_scale.as_ref().is_some_and(|pending| {
+                    pending.worker_id == worker_id && pending.direction == ScaleDirection::Remove
+                }) {
+                    let pending = pending_scale.take().expect("pending scale exists");
+                    record_stage_operation(controls, pending.stage_index, ScaleDirection::Remove);
+                    if let Some(anchor) = controls[pending.stage_index].anchor.as_mut() {
+                        if pending.reason == ScaleReason::AnchorRevert {
+                            anchor.probe = None;
+                            anchor.last_probe_outcome = AnchorProbeOutcome::Reverted;
+                            anchor.probe_interval = grow_duration(anchor.probe_interval);
+                            anchor.next_probe_after = Instant::now() + anchor.probe_interval;
+                            controls[pending.stage_index].scaling_state =
+                                StageScalingState::BackingOff;
+                        } else {
+                            controls[pending.stage_index].scaling_state =
+                                StageScalingState::Eligible;
+                        }
+                    } else {
+                        controls[pending.stage_index].scaling_state = StageScalingState::Eligible;
+                    }
                     *last_scale_completed = Instant::now();
                 }
             }
@@ -1632,7 +2281,9 @@ fn drain_worker_events<E>(
                 if !parked.contains(&worker_id) {
                     parked.push(worker_id);
                 }
-                if matches!(pending_scale, Some(PendingScale::Add { worker_id: id } | PendingScale::Remove { worker_id: id }) if *id == worker_id)
+                if pending_scale
+                    .as_ref()
+                    .is_some_and(|pending| pending.worker_id == worker_id)
                 {
                     *pending_scale = None;
                     *last_scale_completed = Instant::now();
@@ -1663,6 +2314,39 @@ fn remove_worker_from_stage(
     }
 }
 
+fn record_stage_operation(
+    controls: &mut [StageControl],
+    stage_index: usize,
+    direction: ScaleDirection,
+) {
+    let now = Instant::now();
+    let control = &mut controls[stage_index];
+    if let Some((last_direction, last_at)) = control.last_operation {
+        if last_direction != direction
+            && now.duration_since(last_at) <= control.effective_remove_dwell
+        {
+            control.effective_add_dwell = grow_duration(control.effective_add_dwell);
+            control.effective_remove_dwell = grow_duration(control.effective_remove_dwell);
+        }
+    }
+    control.last_operation = Some((direction, now));
+}
+
+fn grow_duration(duration: Duration) -> Duration {
+    let grown = duration.saturating_mul(2);
+    grown.min(Duration::from_secs(5))
+}
+
+fn decay_duration(current: Duration, base: Duration) -> Duration {
+    if current <= base {
+        return current;
+    }
+    let current_nanos = duration_nanos_u64(current);
+    let base_nanos = duration_nanos_u64(base);
+    let decayed = base_nanos + ((current_nanos - base_nanos) * 9 / 10);
+    Duration::from_nanos(decayed.max(base_nanos))
+}
+
 fn sample_pressure(links: &[Link], config: &PiperConfig, pressure: &mut [PressureTimer]) {
     let now = Instant::now();
     for (index, link) in links.iter().enumerate() {
@@ -1689,51 +2373,306 @@ fn sample_pressure(links: &[Link], config: &PiperConfig, pressure: &mut [Pressur
     }
 }
 
+fn collect_stage_samples<E>(
+    workers: &[WorkerSlot<E>],
+    active_by_stage: &[Vec<usize>],
+    pressure: &[PressureTimer],
+    controls: &mut [StageControl],
+) where
+    E: Debug + Display + Send + 'static,
+{
+    for (stage_index, worker_ids) in active_by_stage.iter().enumerate() {
+        let mut sample = StageSample::default();
+        for worker_id in worker_ids {
+            let stats = &workers[*worker_id].stats;
+            sample.process_nanos += stats.process_nanos.swap(0, Ordering::Relaxed);
+            sample.wait_nanos += stats.wait_nanos.swap(0, Ordering::Relaxed);
+            sample.processed_items += stats.processed_items.swap(0, Ordering::Relaxed);
+        }
+
+        let control = &mut controls[stage_index];
+        control.last_sample_processed = sample.processed_items;
+        control.processed_count = control
+            .processed_count
+            .saturating_add(sample.processed_items);
+
+        let total_nanos = sample.process_nanos.saturating_add(sample.wait_nanos);
+        if total_nanos > 0 {
+            control.busy_ratio = sample.process_nanos as f64 / total_nanos as f64;
+        }
+
+        let input_healthy = !pressure[stage_index].state.is_low_pressure();
+        let output_unblocked = pressure.get(stage_index + 1).map_or(true, |pressure| {
+            pressure.state != WaterState::AboveHighWater
+        });
+        if input_healthy && output_unblocked && total_nanos > 0 {
+            update_busy_ceiling(control);
+        }
+
+        if control.settling && sample.processed_items > 0 {
+            control.settling = false;
+            control.scaling_state = StageScalingState::Eligible;
+        }
+
+        if !control.settling
+            && !matches!(
+                control.scaling_state,
+                StageScalingState::Probing | StageScalingState::BackingOff
+            )
+        {
+            control.effective_add_dwell =
+                decay_duration(control.effective_add_dwell, control.base_add_dwell);
+            control.effective_remove_dwell =
+                decay_duration(control.effective_remove_dwell, control.base_remove_dwell);
+        }
+
+        if let Some(anchor) = control.anchor.as_mut() {
+            if !anchor.warmup_complete
+                && sample.processed_items > 0
+                && input_healthy
+                && output_unblocked
+            {
+                anchor.warmup_complete = true;
+                control.scaling_state = StageScalingState::Eligible;
+            }
+        }
+    }
+}
+
+fn update_busy_ceiling(control: &mut StageControl) {
+    let busy = control.busy_ratio.clamp(0.0, 1.0);
+    if busy > control.busy_ceiling {
+        control.busy_ceiling = (control.busy_ceiling * 0.7) + (busy * 0.3);
+    } else if control.busy_ceiling > 0.0 {
+        control.busy_ceiling = (control.busy_ceiling * 0.995).max(busy);
+    } else {
+        control.busy_ceiling = busy;
+    }
+}
+
 enum ScaleOperation {
-    Add(usize),
-    Remove(usize),
+    Add {
+        stage_index: usize,
+        reason: ScaleReason,
+    },
+    Remove {
+        stage_index: usize,
+        worker_id: Option<usize>,
+        reason: ScaleReason,
+    },
 }
 
 fn choose_scale_operation(
-    config: &PiperConfig,
     pressure: &[PressureTimer],
     active_by_stage: &[Vec<usize>],
+    controls: &mut [StageControl],
+    anchor_index: usize,
 ) -> Option<ScaleOperation> {
     let now = Instant::now();
-    let compute = config.compute_stage;
 
-    for link_index in (1..=compute).rev() {
-        if low_elapsed(pressure[link_index], now, config.add_dwell) {
+    if let Some(operation) = choose_anchor_probe_operation(pressure, controls, anchor_index, now) {
+        return Some(operation);
+    }
+
+    if let Some(operation) =
+        choose_support_operation(pressure, active_by_stage, controls, anchor_index, now)
+    {
+        return Some(operation);
+    }
+
+    choose_anchor_operation(pressure, active_by_stage, controls, anchor_index, now)
+}
+
+fn choose_anchor_probe_operation(
+    pressure: &[PressureTimer],
+    controls: &mut [StageControl],
+    anchor_index: usize,
+    now: Instant,
+) -> Option<ScaleOperation> {
+    let control = &mut controls[anchor_index];
+    let Some(anchor) = control.anchor.as_mut() else {
+        return None;
+    };
+
+    if let Some(probe) = anchor.probe.as_ref() {
+        if now.duration_since(probe.started_at) < anchor.probe_window {
+            return None;
+        }
+
+        let input_low = pressure[anchor_index].state.is_low_pressure();
+        let output_high = pressure[anchor_index + 1].state == WaterState::AboveHighWater;
+        let too_idle =
+            control.busy_ceiling > 0.0 && control.busy_ratio < control.busy_ceiling * 0.55;
+
+        if input_low || output_high || too_idle {
+            return Some(ScaleOperation::Remove {
+                stage_index: anchor_index,
+                worker_id: Some(probe.worker_id),
+                reason: ScaleReason::AnchorRevert,
+            });
+        }
+
+        anchor.probe = None;
+        anchor.last_probe_outcome = AnchorProbeOutcome::Kept;
+        anchor.probe_interval = shrink_duration(anchor.probe_interval);
+        anchor.next_probe_after = now + anchor.probe_interval;
+        control.scaling_state = StageScalingState::Eligible;
+    }
+
+    None
+}
+
+fn choose_support_operation(
+    pressure: &[PressureTimer],
+    active_by_stage: &[Vec<usize>],
+    controls: &mut [StageControl],
+    anchor_index: usize,
+    now: Instant,
+) -> Option<ScaleOperation> {
+    for link_index in (1..=anchor_index).rev() {
+        if low_elapsed(
+            pressure[link_index],
+            now,
+            controls[link_index - 1].effective_add_dwell,
+        ) {
             for stage_index in (0..link_index).rev() {
-                if !pressure[stage_index].state.is_low_pressure() {
-                    return Some(ScaleOperation::Add(stage_index));
+                if stage_index == anchor_index {
+                    continue;
+                }
+                if support_can_add(stage_index, pressure, controls) {
+                    return Some(ScaleOperation::Add {
+                        stage_index,
+                        reason: ScaleReason::Support,
+                    });
                 }
             }
         }
     }
 
-    for link_index in 1..=compute {
-        let stage_index = link_index - 1;
-        if high_elapsed(pressure[link_index], now, config.remove_dwell)
-            && !pressure[stage_index].state.is_low_pressure()
-            && active_by_stage[stage_index].len() > 1
+    for stage_index in anchor_index + 1..active_by_stage.len() {
+        if high_elapsed(
+            pressure[stage_index],
+            now,
+            controls[stage_index].effective_add_dwell,
+        ) && support_can_add(stage_index, pressure, controls)
         {
-            return Some(ScaleOperation::Remove(stage_index));
+            return Some(ScaleOperation::Add {
+                stage_index,
+                reason: ScaleReason::Support,
+            });
         }
     }
 
-    for stage_index in compute + 1..active_by_stage.len() {
-        if high_elapsed(pressure[stage_index], now, config.add_dwell) {
-            return Some(ScaleOperation::Add(stage_index));
+    for stage_index in 0..active_by_stage.len() {
+        if stage_index == anchor_index {
+            continue;
         }
-        if low_elapsed(pressure[stage_index], now, config.remove_dwell)
-            && active_by_stage[stage_index].len() > 1
-        {
-            return Some(ScaleOperation::Remove(stage_index));
+
+        let remove_pressure = if stage_index < anchor_index {
+            high_elapsed(
+                pressure[stage_index + 1],
+                now,
+                controls[stage_index].effective_remove_dwell,
+            ) && !pressure[stage_index].state.is_low_pressure()
+        } else {
+            low_elapsed(
+                pressure[stage_index],
+                now,
+                controls[stage_index].effective_remove_dwell,
+            )
+        };
+
+        if remove_pressure && active_by_stage[stage_index].len() > 1 {
+            return Some(ScaleOperation::Remove {
+                stage_index,
+                worker_id: None,
+                reason: ScaleReason::Support,
+            });
         }
     }
 
     None
+}
+
+fn choose_anchor_operation(
+    pressure: &[PressureTimer],
+    active_by_stage: &[Vec<usize>],
+    controls: &mut [StageControl],
+    anchor_index: usize,
+    now: Instant,
+) -> Option<ScaleOperation> {
+    let control = &mut controls[anchor_index];
+    let Some(anchor) = control.anchor.as_mut() else {
+        return None;
+    };
+
+    if anchor.probe.is_some() {
+        return None;
+    }
+
+    if now < anchor.next_probe_after {
+        control.scaling_state = StageScalingState::BackingOff;
+        return None;
+    }
+
+    let active = active_by_stage[anchor_index].len();
+    if active > 1
+        && (low_elapsed(pressure[anchor_index], now, anchor.remove_dwell)
+            || high_elapsed(pressure[anchor_index + 1], now, anchor.remove_dwell))
+    {
+        return Some(ScaleOperation::Remove {
+            stage_index: anchor_index,
+            worker_id: None,
+            reason: ScaleReason::Support,
+        });
+    }
+
+    if active >= anchor.max_threads {
+        control.scaling_state = StageScalingState::Eligible;
+        return None;
+    }
+
+    if !anchor.warmup_complete {
+        control.scaling_state = StageScalingState::BackingOff;
+        return None;
+    }
+
+    let input_ready = !pressure[anchor_index].state.is_low_pressure();
+    let downstream_ready = pressure[anchor_index + 1].state != WaterState::AboveHighWater;
+    let enough_busy_signal = control.busy_ceiling <= 0.0
+        || control.busy_ratio >= (control.busy_ceiling * 0.8)
+        || pressure[anchor_index].state == WaterState::AboveHighWater;
+
+    if input_ready && downstream_ready && enough_busy_signal {
+        return Some(ScaleOperation::Add {
+            stage_index: anchor_index,
+            reason: ScaleReason::AnchorProbe,
+        });
+    }
+
+    control.scaling_state = StageScalingState::Eligible;
+    None
+}
+
+fn support_can_add(
+    stage_index: usize,
+    pressure: &[PressureTimer],
+    controls: &[StageControl],
+) -> bool {
+    if controls[stage_index].settling
+        || matches!(
+            controls[stage_index].scaling_state,
+            StageScalingState::Settling | StageScalingState::Probing
+        )
+    {
+        return false;
+    }
+    !pressure[stage_index].state.is_low_pressure()
+}
+
+fn shrink_duration(duration: Duration) -> Duration {
+    let nanos = duration_nanos_u64(duration);
+    Duration::from_nanos((nanos * 3 / 4).max(10_000_000))
 }
 
 fn low_elapsed(pressure: PressureTimer, now: Instant, dwell: Duration) -> bool {
@@ -1748,6 +2687,24 @@ fn high_elapsed(pressure: PressureTimer, now: Instant, dwell: Duration) -> bool 
         .is_some_and(|since| now.duration_since(since) >= dwell)
 }
 
+fn duration_nanos_u64(duration: Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn anchor_probe_state(anchor: &AnchorControl, active_threads: usize) -> AnchorProbeState {
+    if !anchor.warmup_complete {
+        AnchorProbeState::WarmingUp
+    } else if anchor.probe.is_some() {
+        AnchorProbeState::Probing
+    } else if active_threads >= anchor.max_threads {
+        AnchorProbeState::AtMax
+    } else if Instant::now() < anchor.next_probe_after {
+        AnchorProbeState::BackingOff
+    } else {
+        AnchorProbeState::Eligible
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn update_snapshot<E>(
     snapshot: &Arc<RwLock<PiperSnapshot>>,
@@ -1756,6 +2713,8 @@ fn update_snapshot<E>(
     active_by_stage: &[Vec<usize>],
     parked_threads: usize,
     pressure: &[PressureTimer],
+    controls: &[StageControl],
+    anchor_index: usize,
     shutdown_requested: bool,
     abort_requested: bool,
     pending_scale_operation: bool,
@@ -1779,8 +2738,26 @@ fn update_snapshot<E>(
             index,
             name: stage.name.clone(),
             active_threads: active_by_stage[index].len(),
+            processed_count: controls[index].processed_count,
+            busy_ratio: controls[index].busy_ratio,
+            busy_ceiling: controls[index].busy_ceiling,
+            effective_add_dwell: controls[index].effective_add_dwell,
+            effective_remove_dwell: controls[index].effective_remove_dwell,
+            scaling_state: controls[index].scaling_state,
+            is_anchor: controls[index].anchor.is_some(),
         })
         .collect();
+    if let Some(anchor) = controls[anchor_index].anchor.as_ref() {
+        snapshot.anchor = AnchorSnapshot {
+            stage_index: anchor_index,
+            stage_name: stages[anchor_index].name.clone(),
+            active_threads: active_by_stage[anchor_index].len(),
+            max_threads: anchor.max_threads,
+            probe_state: anchor_probe_state(anchor, active_by_stage[anchor_index].len()),
+            effective_probe_interval: anchor.probe_interval,
+            last_probe_outcome: anchor.last_probe_outcome,
+        };
+    }
     snapshot.parked_threads = parked_threads;
     snapshot.shutdown_requested = shutdown_requested;
     snapshot.abort_requested = abort_requested;
@@ -1816,8 +2793,42 @@ mod tests {
             remove_dwell: Duration::from_millis(5),
             low_water: 2,
             high_water: 4,
-            compute_stage: 1,
-            compute_threads: 1,
+            csv_telemetry: None,
+        }
+    }
+
+    fn support_control() -> StageControl {
+        StageControl {
+            base_add_dwell: Duration::from_millis(5),
+            base_remove_dwell: Duration::from_millis(5),
+            effective_add_dwell: Duration::from_millis(5),
+            effective_remove_dwell: Duration::from_millis(5),
+            processed_count: 0,
+            busy_ratio: 0.0,
+            busy_ceiling: 0.0,
+            last_sample_processed: 0,
+            scaling_state: StageScalingState::Eligible,
+            settling: false,
+            last_operation: None,
+            anchor: None,
+        }
+    }
+
+    fn anchor_control(max_threads: usize) -> StageControl {
+        StageControl {
+            anchor: Some(AnchorControl {
+                max_threads,
+                probe_interval: Duration::from_millis(10),
+                probe_window: Duration::from_millis(10),
+                remove_dwell: Duration::from_millis(5),
+                warmup_complete: true,
+                probe: None,
+                next_probe_after: Instant::now() - Duration::from_millis(1),
+                last_probe_outcome: AnchorProbeOutcome::None,
+            }),
+            busy_ratio: 0.8,
+            busy_ceiling: 0.8,
+            ..support_control()
         }
     }
 
@@ -1852,9 +2863,8 @@ mod tests {
     }
 
     #[test]
-    fn pre_compute_add_skips_starved_upstream_stages() {
-        let mut config = test_config();
-        config.compute_stage = 2;
+    fn support_add_skips_starved_upstream_stages() {
+        let config = test_config();
         let elapsed = Instant::now() - config.add_dwell - Duration::from_millis(1);
         let active = vec![vec![0], vec![1], vec![2]];
         let mut pressure = vec![
@@ -1875,21 +2885,24 @@ mod tests {
             },
             PressureTimer::default(),
         ];
+        let mut controls = vec![support_control(), support_control(), anchor_control(1)];
 
-        assert!(choose_scale_operation(&config, &pressure, &active).is_none());
+        assert!(choose_scale_operation(&pressure, &active, &mut controls, 2).is_none());
 
         pressure[0].state = WaterState::Nominal;
         pressure[0].low_since = None;
         assert!(matches!(
-            choose_scale_operation(&config, &pressure, &active),
-            Some(ScaleOperation::Add(0))
+            choose_scale_operation(&pressure, &active, &mut controls, 2),
+            Some(ScaleOperation::Add {
+                stage_index: 0,
+                reason: ScaleReason::Support
+            })
         ));
     }
 
     #[test]
-    fn post_compute_scaling_uses_local_input_pressure() {
-        let mut config = test_config();
-        config.compute_stage = 0;
+    fn post_anchor_scaling_uses_local_input_pressure() {
+        let config = test_config();
         let elapsed = Instant::now() - config.add_dwell - Duration::from_millis(1);
         let active = vec![vec![0], vec![1]];
         let pressure = vec![
@@ -1905,10 +2918,14 @@ mod tests {
             },
             PressureTimer::default(),
         ];
+        let mut controls = vec![anchor_control(1), support_control()];
 
         assert!(matches!(
-            choose_scale_operation(&config, &pressure, &active),
-            Some(ScaleOperation::Add(1))
+            choose_scale_operation(&pressure, &active, &mut controls, 0),
+            Some(ScaleOperation::Add {
+                stage_index: 1,
+                reason: ScaleReason::Support
+            })
         ));
 
         let active = vec![vec![0], vec![1, 2]];
@@ -1926,10 +2943,41 @@ mod tests {
             },
             PressureTimer::default(),
         ];
+        let mut controls = vec![anchor_control(1), support_control()];
 
         assert!(matches!(
-            choose_scale_operation(&config, &pressure, &active),
-            Some(ScaleOperation::Remove(1))
+            choose_scale_operation(&pressure, &active, &mut controls, 0),
+            Some(ScaleOperation::Remove {
+                stage_index: 1,
+                reason: ScaleReason::Support,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn anchor_scales_up_after_warmup_when_busy_and_fed() {
+        let active = vec![vec![0]];
+        let pressure = vec![
+            PressureTimer {
+                state: WaterState::Nominal,
+                low_since: None,
+                high_since: None,
+            },
+            PressureTimer {
+                state: WaterState::Nominal,
+                low_since: None,
+                high_since: None,
+            },
+        ];
+        let mut controls = vec![anchor_control(2)];
+
+        assert!(matches!(
+            choose_scale_operation(&pressure, &active, &mut controls, 0),
+            Some(ScaleOperation::Add {
+                stage_index: 0,
+                reason: ScaleReason::AnchorProbe
+            })
         ));
     }
 
@@ -1968,27 +3016,30 @@ mod tests {
         drop(BufferLease::new(vec![1], recycle_sender, runtime));
 
         assert!(abort.load(Ordering::Acquire));
-        assert!(failure_receiver.recv().unwrap().message.contains("recycle"));
+        let InternalFailure::Internal { message } = failure_receiver.recv().unwrap() else {
+            panic!("expected internal recycle failure");
+        };
+        assert!(message.contains("recycle"));
     }
 
     #[test]
     fn cleanup_failure_is_reported_from_join() {
-        let config = PiperConfig {
-            compute_stage: 0,
-            ..test_config()
-        };
+        let config = test_config();
         let piper = Piper::<u8, u8, TestError>::start(
             config,
             vec![
-                inline_stage(
-                    "cleanup",
-                    || -> std::result::Result<(), TestError> { Ok(()) },
-                    |_state: &mut (), input: u8, ctx: &mut StageContext<u8, TestError>| {
-                        ctx.emit(input);
-                        Ok(())
-                    },
+                anchor(
+                    inline_stage(
+                        "cleanup",
+                        || -> std::result::Result<(), TestError> { Ok(()) },
+                        |_state: &mut (), input: u8, ctx: &mut StageContext<u8, TestError>| {
+                            ctx.emit(input);
+                            Ok(())
+                        },
+                    )
+                    .with_cleanup(|_state| Err(TestError::Boom)),
                 )
-                .with_cleanup(|_state| Err(TestError::Boom))
+                .max_threads(1)
                 .into_stage_spec(),
             ],
         )

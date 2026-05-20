@@ -1,14 +1,15 @@
 use piper::{
-    BufferLease, PiperConfig, PiperSnapshot, Stage, StageContext, StageExt, WaterState, pipeline,
+    BufferLease, CsvTelemetryConfig, PiperConfig, PiperSnapshot, Stage, StageContext, StageExt,
+    WaterState, anchor, pipeline,
 };
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const BATCH_COUNT: usize = 1_500;
 const BATCH_SIZE: usize = 2_048;
-const COMPUTE_ROUNDS: usize = 6_144;
-const EMIT_ROUNDS: usize = 12_288;
+const COMPUTE_ROUNDS: usize = 12_288;
+const EMIT_ROUNDS: usize = 24_576;
 const TELEMETRY_INTERVAL: Duration = Duration::from_millis(250);
 
 type Batch = Vec<u64>;
@@ -149,24 +150,39 @@ pipeline! {
         type Output = Batch;
         type Error = ExampleError;
 
-        config = PiperConfig {
-            sample_interval: Duration::from_millis(10),
-            poll_interval: Duration::from_millis(5),
-            scale_cooldown: Duration::from_millis(20),
-            add_dwell: Duration::from_millis(40),
-            remove_dwell: Duration::from_millis(500),
-            low_water: 2,
-            high_water: 24,
-            compute_stage: 2,
-            compute_threads: 2,
-        };
+        config = config();
 
         stages = [
             Prepare.with_reusable_output(|| Vec::<u64>::with_capacity(BATCH_SIZE)),
             Normalize.with_reusable_output(|| Vec::<u64>::with_capacity(BATCH_SIZE)),
-            Compute.with_reusable_output(|| Vec::<u64>::with_capacity(BATCH_SIZE)),
+            anchor(Compute)
+                .max_threads(4)
+                .initial_threads(2)
+                .probe_interval(Duration::from_millis(100))
+                .probe_window(Duration::from_millis(250))
+                .remove_dwell(Duration::from_millis(500))
+                .with_reusable_output(|| Vec::<u64>::with_capacity(BATCH_SIZE)),
             Emit,
         ];
+    }
+}
+
+fn config() -> PiperConfig {
+    PiperConfig {
+        sample_interval: Duration::from_millis(10),
+        poll_interval: Duration::from_millis(5),
+        scale_cooldown: Duration::from_millis(20),
+        add_dwell: Duration::from_millis(40),
+        remove_dwell: Duration::from_millis(500),
+        low_water: 2,
+        high_water: 24,
+        csv_telemetry: Some(CsvTelemetryConfig::new(format!(
+            "piper_{}.csv",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ))),
     }
 }
 
@@ -247,10 +263,13 @@ fn print_telemetry(elapsed: Duration, telemetry: &PiperSnapshot, received_batche
         .join(", ");
 
     println!(
-        "[{:>6.2}s] received={received_batches}/{BATCH_COUNT} parked={} pending={} stages=[{stages}] links=[{links}]",
+        "[{:>6.2}s] received={received_batches}/{BATCH_COUNT} parked={} pending={} anchor={}/{} {:?} stages=[{stages}] links=[{links}]",
         elapsed.as_secs_f64(),
         telemetry.parked_threads,
         telemetry.pending_scale_operation,
+        telemetry.anchor.active_threads,
+        telemetry.anchor.max_threads,
+        telemetry.anchor.probe_state,
     );
 }
 

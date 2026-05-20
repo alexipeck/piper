@@ -1,4 +1,4 @@
-use piper::{PiperConfig, Stage, StageContext, inline_stage, pipeline, stage};
+use piper::{PiperConfig, Stage, StageContext, anchor, inline_stage, pipeline, stage};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -60,8 +60,7 @@ fn config() -> PiperConfig {
         remove_dwell: Duration::from_millis(1),
         low_water: 1,
         high_water: 8,
-        compute_stage: 0,
-        compute_threads: 1,
+        csv_telemetry: None,
     }
 }
 
@@ -72,7 +71,7 @@ pipeline! {
         type Error = MacroError;
 
         config = config();
-        stages = [Widen, Keep];
+        stages = [anchor(Widen).max_threads(1), Keep];
     }
 }
 
@@ -83,7 +82,7 @@ pipeline! {
         type Error = MacroError;
 
         config = config();
-        stages = [stage("widen", Widen), stage("keep", Keep)];
+        stages = [anchor(stage("widen", Widen)).max_threads(1), stage("keep", Keep)];
     }
 }
 
@@ -95,14 +94,14 @@ pipeline! {
 
         config = config();
         stages = [
-            inline_stage(
+            anchor(inline_stage(
                 "widen",
                 || -> std::result::Result<(), MacroError> { Ok(()) },
                 |_state: &mut (), input: u8, ctx: &mut StageContext<u16, MacroError>| {
                     ctx.emit(input as u16);
                     Ok(())
                 },
-            ),
+            )).max_threads(1),
         ];
     }
 }

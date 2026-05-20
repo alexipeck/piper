@@ -1,4 +1,4 @@
-use piper::{PiperConfig, Stage, StageContext, inline_stage, pipeline, stage};
+use piper::{PiperConfig, Stage, StageContext, anchor, inline_stage, pipeline, stage};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use thiserror::Error;
@@ -86,8 +86,7 @@ fn config() -> PiperConfig {
         remove_dwell: Duration::from_millis(100),
         low_water: 1,
         high_water: 8,
-        compute_stage: 1,
-        compute_threads: 1,
+        csv_telemetry: None,
     }
 }
 
@@ -98,7 +97,7 @@ pipeline! {
         type Error = ExampleError;
 
         config = config();
-        stages = [AddOne, Square, FormatValue];
+        stages = [AddOne, anchor(Square).max_threads(1), FormatValue];
     }
 }
 
@@ -111,7 +110,7 @@ pipeline! {
         config = config();
         stages = [
             stage("add", AddOne),
-            stage("square", Square),
+            anchor(stage("square", Square)).max_threads(1),
             stage("format", FormatValue),
         ];
     }
@@ -133,14 +132,14 @@ pipeline! {
                     Ok(())
                 },
             ),
-            inline_stage(
+            anchor(inline_stage(
                 "square",
                 || -> std::result::Result<(), ExampleError> { Ok(()) },
                 |_state: &mut (), input: u32, ctx: &mut StageContext<u32, ExampleError>| {
                     ctx.emit(input * input);
                     Ok(())
                 },
-            ),
+            )).max_threads(1),
             inline_stage(
                 "format",
                 || -> std::result::Result<(), ExampleError> { Ok(()) },

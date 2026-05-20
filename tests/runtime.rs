@@ -1,6 +1,8 @@
 use piper::{
-    IntoStageSpec, Piper, PiperConfig, PiperError, Stage, StageContext, inline_stage, stage,
+    CsvTelemetryConfig, IntoStageSpec, Piper, PiperConfig, PiperError, Stage, StageContext, anchor,
+    inline_stage, stage,
 };
+use std::fs;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -19,8 +21,7 @@ fn config() -> PiperConfig {
         remove_dwell: Duration::from_millis(5),
         low_water: 1,
         high_water: 2,
-        compute_stage: 1,
-        compute_threads: 1,
+        csv_telemetry: None,
     }
 }
 
@@ -97,7 +98,10 @@ impl Stage for Pass {
 fn associated_type_stages_stream_outputs_and_default_cleanup_is_optional() {
     let piper = Piper::<u32, String, TestError>::start(
         config(),
-        vec![stage("double", Double), stage("format", FormatValue)],
+        vec![
+            anchor(stage("double", Double)).max_threads(1),
+            stage("format", FormatValue),
+        ],
     )
     .unwrap();
 
@@ -123,7 +127,10 @@ fn associated_type_stages_stream_outputs_and_default_cleanup_is_optional() {
 fn get_telemetry_reports_operational_state() {
     let piper = Piper::<u32, u32, TestError>::start(
         config(),
-        vec![stage("left", Pass), stage("right", Pass)],
+        vec![
+            stage("left", Pass),
+            anchor(stage("right", Pass)).max_threads(1),
+        ],
     )
     .unwrap();
 
@@ -134,6 +141,9 @@ fn get_telemetry_reports_operational_state() {
     assert_eq!(telemetry.stages.len(), 2);
     assert_eq!(telemetry.stages[0].active_threads, 1);
     assert_eq!(telemetry.stages[1].active_threads, 1);
+    assert_eq!(telemetry.anchor.stage_index, 1);
+    assert_eq!(telemetry.anchor.max_threads, 1);
+    assert!(telemetry.stages.iter().any(|stage| stage.is_anchor));
     assert!(telemetry.parked_threads >= 2);
 
     piper.abort();
@@ -146,23 +156,23 @@ fn abort_skips_inline_builder_cleanup() {
     let cleaned_for_stage = std::sync::Arc::clone(&cleaned);
 
     let piper = Piper::<u32, u32, TestError>::start(
-        PiperConfig {
-            compute_stage: 0,
-            ..config()
-        },
+        config(),
         vec![
-            inline_stage(
-                "cleanup",
-                || -> std::result::Result<(), TestError> { Ok(()) },
-                |_state: &mut (), input: u32, ctx: &mut StageContext<u32, TestError>| {
-                    ctx.emit(input);
+            anchor(
+                inline_stage(
+                    "cleanup",
+                    || -> std::result::Result<(), TestError> { Ok(()) },
+                    |_state: &mut (), input: u32, ctx: &mut StageContext<u32, TestError>| {
+                        ctx.emit(input);
+                        Ok(())
+                    },
+                )
+                .with_cleanup(move |_state| {
+                    cleaned_for_stage.store(true, std::sync::atomic::Ordering::Release);
                     Ok(())
-                },
+                }),
             )
-            .with_cleanup(move |_state| {
-                cleaned_for_stage.store(true, std::sync::atomic::Ordering::Release);
-                Ok(())
-            })
+            .max_threads(1)
             .into_stage_spec(),
         ],
     )
@@ -177,17 +187,88 @@ fn abort_skips_inline_builder_cleanup() {
 #[test]
 fn user_process_failure_fails_pipeline() {
     let piper = Piper::<u32, u32, TestError>::start(
-        PiperConfig {
-            compute_stage: 0,
-            ..config()
-        },
-        vec![stage("fail", Fail)],
+        config(),
+        vec![anchor(stage("fail", Fail)).max_threads(1)],
     )
     .unwrap();
 
     piper.sender().send(1).unwrap();
     let error = piper.join().expect_err("process error should fail join");
     assert!(matches!(error, PiperError::UserProcess { .. }));
+}
+
+#[test]
+fn piper_requires_exactly_one_anchor() {
+    let no_anchor = Piper::<u32, u32, TestError>::start(config(), vec![stage("pass", Pass)]);
+    let Err(no_anchor) = no_anchor else {
+        panic!("missing anchor should fail");
+    };
+    assert!(matches!(
+        no_anchor,
+        PiperError::InvalidAnchorCount { count: 0 }
+    ));
+
+    let two_anchors = Piper::<u32, u32, TestError>::start(
+        config(),
+        vec![
+            anchor(stage("left", Pass)).max_threads(1),
+            anchor(stage("right", Pass)).max_threads(1),
+        ],
+    );
+    let Err(two_anchors) = two_anchors else {
+        panic!("multiple anchors should fail");
+    };
+    assert!(matches!(
+        two_anchors,
+        PiperError::InvalidAnchorCount { count: 2 }
+    ));
+}
+
+#[test]
+fn csv_telemetry_writes_wide_rows_and_existing_path_fails() {
+    let path = std::env::temp_dir().join(format!(
+        "piper_test_{}_{}.csv",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("runtime")
+    ));
+    let _ = fs::remove_file(&path);
+
+    let piper = Piper::<u32, u32, TestError>::start(
+        PiperConfig {
+            csv_telemetry: Some(CsvTelemetryConfig::new(&path).interval(Duration::from_millis(5))),
+            ..config()
+        },
+        vec![anchor(stage("pass", Pass)).max_threads(1)],
+    )
+    .unwrap();
+    piper.sender().send(1).unwrap();
+    assert_eq!(
+        piper
+            .receiver()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap(),
+        1
+    );
+    piper.shutdown();
+    piper.join().unwrap();
+
+    let csv = fs::read_to_string(&path).unwrap();
+    assert!(csv.starts_with("elapsed_ms,shutdown_requested"));
+    assert!(csv.contains("stage0_busy_ratio"));
+    assert!(csv.lines().count() >= 2);
+
+    let existing = Piper::<u32, u32, TestError>::start(
+        PiperConfig {
+            csv_telemetry: Some(CsvTelemetryConfig::new(&path)),
+            ..config()
+        },
+        vec![anchor(stage("pass", Pass)).max_threads(1)],
+    );
+    let Err(existing) = existing else {
+        panic!("existing CSV path should fail");
+    };
+    assert!(matches!(existing, PiperError::Telemetry { .. }));
+    let _ = fs::remove_file(&path);
 }
 
 struct Fail;
