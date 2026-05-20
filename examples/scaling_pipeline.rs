@@ -10,7 +10,7 @@ const BATCH_COUNT: usize = 1_500;
 const BATCH_SIZE: usize = 2_048;
 const COMPUTE_ROUNDS: usize = 12_288;
 const EMIT_ROUNDS: usize = 24_576;
-const TELEMETRY_INTERVAL: Duration = Duration::from_millis(250);
+const TELEMETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 type Batch = Vec<u64>;
 type BatchLease = BufferLease<Vec<u64>>;
@@ -249,31 +249,76 @@ fn main() -> piper::Result<(), ExampleError> {
 }
 
 fn print_telemetry(elapsed: Duration, telemetry: &PiperSnapshot, received_batches: usize) {
-    let stages = telemetry
-        .stages
-        .iter()
-        .map(|stage| format!("{}:{}", stage.name, stage.active_threads))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let links = telemetry
-        .links
-        .iter()
-        .map(|link| format!("L{}:{}:{}", link.index, link.len, water_label(link.state)))
-        .collect::<Vec<_>>()
-        .join(", ");
-
     println!(
-        "[{:>6.2}s] received={received_batches}/{BATCH_COUNT} parked={} pending={} anchor={}/{} {:?} stages=[{stages}] links=[{links}]",
+        "\n[{:>5.2}s] rx={received_batches}/{BATCH_COUNT} | parked={} | pending={} | anchor={} {}/{} {:?}",
         elapsed.as_secs_f64(),
         telemetry.parked_threads,
         telemetry.pending_scale_operation,
+        telemetry.anchor.stage_name,
         telemetry.anchor.active_threads,
         telemetry.anchor.max_threads,
         telemetry.anchor.probe_state,
     );
+    println!(
+        "  {:<11} {:>3}  {:<34} {:<34} {:>5}  scale",
+        "stage", "w", "input", "output", "busy"
+    );
+
+    for index in 0..telemetry.stages.len() {
+        println!("  {}", stage_summary(index, telemetry));
+    }
 }
 
-fn water_label(state: WaterState) -> &'static str {
+fn stage_summary(index: usize, telemetry: &PiperSnapshot) -> String {
+    let stage = &telemetry.stages[index];
+    let marker = if stage.is_anchor { "*" } else { "" };
+    let busy = (stage.busy_ratio * 100.0).clamp(0.0, 100.0);
+    let name = format!("{}{}", stage.name, marker);
+
+    format!(
+        "{:<11} {:>3}  {:<34} {:<34} {:>4.0}%  {:?}",
+        name,
+        stage.active_threads,
+        queue_status(index, telemetry),
+        queue_status(index + 1, telemetry),
+        busy,
+        stage.scaling_state,
+    )
+}
+
+fn queue_status(index: usize, telemetry: &PiperSnapshot) -> String {
+    let link = &telemetry.links[index];
+    format!(
+        "{} {}/{}",
+        queue_label(index, telemetry),
+        link.len,
+        water_label_for_queue(index, link.state, telemetry)
+    )
+}
+
+fn queue_label(index: usize, telemetry: &PiperSnapshot) -> String {
+    if index == 0 {
+        "IN".to_string()
+    } else if index + 1 == telemetry.links.len() {
+        "OUT".to_string()
+    } else {
+        format!(
+            "{}->{}",
+            telemetry.stages[index - 1].name,
+            telemetry.stages[index].name
+        )
+    }
+}
+
+fn water_label_for_queue(
+    index: usize,
+    state: WaterState,
+    telemetry: &PiperSnapshot,
+) -> &'static str {
+    if index + 1 == telemetry.links.len() && state == WaterState::Starved {
+        return "empty";
+    }
+
     match state {
         WaterState::Starved => "starved",
         WaterState::BelowLowWater => "low",
