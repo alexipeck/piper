@@ -109,7 +109,10 @@ pub fn pipeline(input: TokenStream) -> TokenStream {
 
         impl #name {
             pub fn start() -> ::piper::Result<::piper::Piper<#input, #output, #error>, #error> {
-                ::piper::Piper::start(#config, vec![#(#stages),*])
+                ::piper::Piper::start(
+                    #config,
+                    vec![#(::piper::IntoStageSpec::into_stage_spec(#stages)),*],
+                )
             }
         }
     }

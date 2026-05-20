@@ -520,24 +520,22 @@ where
     }
 }
 
-pub trait Stage<In, Out, E>: Send + Sync + 'static
-where
-    In: Send + 'static,
-    Out: Send + 'static,
-    E: Debug + Display + Send + 'static,
-{
+pub trait Stage: Send + Sync + 'static {
+    type Input: Send + 'static;
+    type Output: Send + 'static;
+    type Error: Debug + Display + Send + 'static;
     type State: Send + 'static;
 
-    fn init(&self) -> std::result::Result<Self::State, E>;
+    fn init(&self) -> std::result::Result<Self::State, Self::Error>;
 
     fn process(
         &self,
         state: &mut Self::State,
-        input: In,
-        ctx: &mut StageContext<Out, E>,
-    ) -> std::result::Result<(), E>;
+        input: Self::Input,
+        ctx: &mut StageContext<Self::Output, Self::Error>,
+    ) -> std::result::Result<(), Self::Error>;
 
-    fn cleanup(&self, _state: Self::State) -> std::result::Result<(), E> {
+    fn cleanup(&self, _state: Self::State) -> std::result::Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -566,25 +564,18 @@ struct RuntimeStageContext {
     internal_failure: kanal::Sender<InternalFailure>,
 }
 
-struct StageAdapter<S, In, Out, E>
+struct StageAdapter<S>
 where
-    In: Send + 'static,
-    Out: Send + 'static,
-    E: Debug + Display + Send + 'static,
-    S: Stage<In, Out, E>,
+    S: Stage,
 {
     stage: S,
-    _marker: PhantomData<fn(In, Out, E)>,
 }
 
-impl<S, In, Out, E> DynStage<E> for StageAdapter<S, In, Out, E>
+impl<S> DynStage<S::Error> for StageAdapter<S>
 where
-    In: Send + 'static,
-    Out: Send + 'static,
-    E: Debug + Display + Send + 'static,
-    S: Stage<In, Out, E>,
+    S: Stage,
 {
-    fn init_box(&self) -> std::result::Result<Box<dyn Any + Send>, StageFailure<E>> {
+    fn init_box(&self) -> std::result::Result<Box<dyn Any + Send>, StageFailure<S::Error>> {
         self.stage
             .init()
             .map(|state| Box::new(state) as Box<dyn Any + Send>)
@@ -596,17 +587,17 @@ where
         state: &mut dyn Any,
         input: Message,
         ctx: RuntimeStageContext,
-    ) -> std::result::Result<(), StageFailure<E>> {
+    ) -> std::result::Result<(), StageFailure<S::Error>> {
         let state = state
             .downcast_mut::<S::State>()
             .ok_or_else(|| StageFailure::Internal("stage state type mismatch".to_string()))?;
         let input = input
-            .downcast::<In>()
+            .downcast::<S::Input>()
             .map(|input| *input)
             .map_err(|_| StageFailure::Internal("stage input type mismatch".to_string()))?;
         let output_acquire = match ctx.output_acquire {
             Some(acquire) => Some(
-                Arc::downcast::<Arc<AcquireFn<Out>>>(acquire)
+                Arc::downcast::<Arc<AcquireFn<S::Output>>>(acquire)
                     .map_err(|_| {
                         StageFailure::Internal("stage output factory type mismatch".to_string())
                     })?
@@ -628,7 +619,10 @@ where
             .map_err(StageFailure::Process)
     }
 
-    fn cleanup_box(&self, state: Box<dyn Any + Send>) -> std::result::Result<(), StageFailure<E>> {
+    fn cleanup_box(
+        &self,
+        state: Box<dyn Any + Send>,
+    ) -> std::result::Result<(), StageFailure<S::Error>> {
         let state = state
             .downcast::<S::State>()
             .map(|state| *state)
@@ -656,7 +650,7 @@ where
     _marker: PhantomData<fn(State, In, Out, E)>,
 }
 
-impl<Init, Process, Cleanup, State, In, Out, E> Stage<In, Out, E>
+impl<Init, Process, Cleanup, State, In, Out, E> Stage
     for InlineStage<Init, Process, Cleanup, State, In, Out, E>
 where
     Init: Fn() -> std::result::Result<State, E> + Send + Sync + 'static,
@@ -670,22 +664,25 @@ where
     Out: Send + 'static,
     E: Debug + Display + Send + 'static,
 {
+    type Input = In;
+    type Output = Out;
+    type Error = E;
     type State = State;
 
-    fn init(&self) -> std::result::Result<Self::State, E> {
+    fn init(&self) -> std::result::Result<Self::State, Self::Error> {
         (self.init)()
     }
 
     fn process(
         &self,
         state: &mut Self::State,
-        input: In,
-        ctx: &mut StageContext<Out, E>,
-    ) -> std::result::Result<(), E> {
+        input: Self::Input,
+        ctx: &mut StageContext<Self::Output, Self::Error>,
+    ) -> std::result::Result<(), Self::Error> {
         (self.process)(state, input, ctx)
     }
 
-    fn cleanup(&self, state: Self::State) -> std::result::Result<(), E> {
+    fn cleanup(&self, state: Self::State) -> std::result::Result<(), Self::Error> {
         (self.cleanup)(state)
     }
 }
@@ -716,29 +713,63 @@ where
     }
 }
 
-pub fn trait_stage<S, In, Out, E>(name: impl Into<String>, stage: S) -> StageSpec<E>
+pub trait IntoStageSpec<E>
 where
-    S: Stage<In, Out, E>,
-    In: Send + 'static,
-    Out: Send + 'static,
     E: Debug + Display + Send + 'static,
+{
+    fn into_stage_spec(self) -> StageSpec<E>;
+}
+
+impl<E> IntoStageSpec<E> for StageSpec<E>
+where
+    E: Debug + Display + Send + 'static,
+{
+    fn into_stage_spec(self) -> StageSpec<E> {
+        self
+    }
+}
+
+impl<S> IntoStageSpec<S::Error> for S
+where
+    S: Stage,
+{
+    fn into_stage_spec(self) -> StageSpec<S::Error> {
+        stage(default_stage_name::<S>(), self)
+    }
+}
+
+pub trait StageExt: Stage + Sized {
+    fn with_reusable_output<T, Factory>(self, factory: Factory) -> StageSpec<Self::Error>
+    where
+        T: Recycle + Send + 'static,
+        Factory: Fn() -> T + Send + Sync + 'static,
+    {
+        stage(default_stage_name::<Self>(), self).with_reusable_output(factory)
+    }
+}
+
+impl<S> StageExt for S where S: Stage {}
+
+pub fn stage<S>(name: impl Into<String>, stage_impl: S) -> StageSpec<S::Error>
+where
+    S: Stage,
 {
     StageSpec {
         name: name.into(),
-        stage: Arc::new(StageAdapter {
-            stage,
-            _marker: PhantomData::<fn(In, Out, E)>,
-        }),
+        stage: Arc::new(StageAdapter { stage: stage_impl }),
         output_acquire_builder: None,
     }
 }
 
-pub fn inline_stage<Init, Process, Cleanup, State, In, Out, E>(
-    name: impl Into<String>,
-    init: Init,
-    process: Process,
-    cleanup: Cleanup,
-) -> StageSpec<E>
+fn default_stage_name<S>() -> String {
+    std::any::type_name::<S>()
+        .rsplit("::")
+        .next()
+        .unwrap_or("stage")
+        .to_string()
+}
+
+pub struct InlineStageBuilder<Init, Process, Cleanup, State, In, Out, E>
 where
     Init: Fn() -> std::result::Result<State, E> + Send + Sync + 'static,
     Process: Fn(&mut State, In, &mut StageContext<Out, E>) -> std::result::Result<(), E>
@@ -751,22 +782,88 @@ where
     Out: Send + 'static,
     E: Debug + Display + Send + 'static,
 {
-    trait_stage(
-        name,
-        InlineStage {
-            init,
-            process,
-            cleanup,
-            _marker: PhantomData::<fn(State, In, Out, E)>,
-        },
-    )
+    name: String,
+    init: Init,
+    process: Process,
+    cleanup: Cleanup,
+    _marker: PhantomData<fn(State, In, Out, E)>,
 }
 
-pub fn inline_stage_no_cleanup<Init, Process, State, In, Out, E>(
+impl<Init, Process, Cleanup, State, In, Out, E>
+    InlineStageBuilder<Init, Process, Cleanup, State, In, Out, E>
+where
+    Init: Fn() -> std::result::Result<State, E> + Send + Sync + 'static,
+    Process: Fn(&mut State, In, &mut StageContext<Out, E>) -> std::result::Result<(), E>
+        + Send
+        + Sync
+        + 'static,
+    Cleanup: Fn(State) -> std::result::Result<(), E> + Send + Sync + 'static,
+    State: Send + 'static,
+    In: Send + 'static,
+    Out: Send + 'static,
+    E: Debug + Display + Send + 'static,
+{
+    pub fn with_cleanup<NextCleanup>(
+        self,
+        cleanup: NextCleanup,
+    ) -> InlineStageBuilder<Init, Process, NextCleanup, State, In, Out, E>
+    where
+        NextCleanup: Fn(State) -> std::result::Result<(), E> + Send + Sync + 'static,
+    {
+        InlineStageBuilder {
+            name: self.name,
+            init: self.init,
+            process: self.process,
+            cleanup,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn with_reusable_output<T, Factory>(self, factory: Factory) -> StageSpec<E>
+    where
+        T: Recycle + Send + 'static,
+        Factory: Fn() -> T + Send + Sync + 'static,
+    {
+        self.into_stage_spec().with_reusable_output(factory)
+    }
+}
+
+impl<Init, Process, Cleanup, State, In, Out, E> IntoStageSpec<E>
+    for InlineStageBuilder<Init, Process, Cleanup, State, In, Out, E>
+where
+    Init: Fn() -> std::result::Result<State, E> + Send + Sync + 'static,
+    Process: Fn(&mut State, In, &mut StageContext<Out, E>) -> std::result::Result<(), E>
+        + Send
+        + Sync
+        + 'static,
+    Cleanup: Fn(State) -> std::result::Result<(), E> + Send + Sync + 'static,
+    State: Send + 'static,
+    In: Send + 'static,
+    Out: Send + 'static,
+    E: Debug + Display + Send + 'static,
+{
+    fn into_stage_spec(self) -> StageSpec<E> {
+        stage(
+            self.name,
+            InlineStage {
+                init: self.init,
+                process: self.process,
+                cleanup: self.cleanup,
+                _marker: PhantomData::<fn(State, In, Out, E)>,
+            },
+        )
+    }
+}
+
+fn default_inline_cleanup<State, E>(_state: State) -> std::result::Result<(), E> {
+    Ok(())
+}
+
+pub fn inline_stage<Init, Process, State, In, Out, E>(
     name: impl Into<String>,
     init: Init,
     process: Process,
-) -> StageSpec<E>
+) -> InlineStageBuilder<Init, Process, fn(State) -> std::result::Result<(), E>, State, In, Out, E>
 where
     Init: Fn() -> std::result::Result<State, E> + Send + Sync + 'static,
     Process: Fn(&mut State, In, &mut StageContext<Out, E>) -> std::result::Result<(), E>
@@ -778,7 +875,13 @@ where
     Out: Send + 'static,
     E: Debug + Display + Send + 'static,
 {
-    inline_stage(name, init, process, |_state| Ok(()))
+    InlineStageBuilder {
+        name: name.into(),
+        init,
+        process,
+        cleanup: default_inline_cleanup::<State, E>,
+        _marker: PhantomData,
+    }
 }
 
 trait OutputAcquireBuilder {
@@ -1064,7 +1167,7 @@ where
         self.abort.store(true, Ordering::Release);
     }
 
-    pub fn snapshot(&self) -> PiperSnapshot {
+    pub fn get_telemetry(&self) -> PiperSnapshot {
         self.snapshot.read().clone()
     }
 
@@ -1876,15 +1979,18 @@ mod tests {
         };
         let piper = Piper::<u8, u8, TestError>::start(
             config,
-            vec![inline_stage(
-                "cleanup",
-                || -> std::result::Result<(), TestError> { Ok(()) },
-                |_state: &mut (), input: u8, ctx: &mut StageContext<u8, TestError>| {
-                    ctx.emit(input);
-                    Ok(())
-                },
-                |_state| Err(TestError::Boom),
-            )],
+            vec![
+                inline_stage(
+                    "cleanup",
+                    || -> std::result::Result<(), TestError> { Ok(()) },
+                    |_state: &mut (), input: u8, ctx: &mut StageContext<u8, TestError>| {
+                        ctx.emit(input);
+                        Ok(())
+                    },
+                )
+                .with_cleanup(|_state| Err(TestError::Boom))
+                .into_stage_spec(),
+            ],
         )
         .unwrap();
 

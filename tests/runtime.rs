@@ -1,4 +1,6 @@
-use piper::{Piper, PiperConfig, PiperError, StageContext, inline_stage_no_cleanup};
+use piper::{
+    IntoStageSpec, Piper, PiperConfig, PiperError, Stage, StageContext, inline_stage, stage,
+};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -22,28 +24,80 @@ fn config() -> PiperConfig {
     }
 }
 
+struct Double;
+
+impl Stage for Double {
+    type Input = u32;
+    type Output = u32;
+    type Error = TestError;
+    type State = ();
+
+    fn init(&self) -> std::result::Result<Self::State, Self::Error> {
+        Ok(())
+    }
+
+    fn process(
+        &self,
+        _state: &mut Self::State,
+        input: Self::Input,
+        ctx: &mut StageContext<Self::Output, Self::Error>,
+    ) -> std::result::Result<(), Self::Error> {
+        ctx.emit(input * 2);
+        Ok(())
+    }
+}
+
+struct FormatValue;
+
+impl Stage for FormatValue {
+    type Input = u32;
+    type Output = String;
+    type Error = TestError;
+    type State = ();
+
+    fn init(&self) -> std::result::Result<Self::State, Self::Error> {
+        Ok(())
+    }
+
+    fn process(
+        &self,
+        _state: &mut Self::State,
+        input: Self::Input,
+        ctx: &mut StageContext<Self::Output, Self::Error>,
+    ) -> std::result::Result<(), Self::Error> {
+        ctx.emit(format!("value={input}"));
+        Ok(())
+    }
+}
+
+struct Pass;
+
+impl Stage for Pass {
+    type Input = u32;
+    type Output = u32;
+    type Error = TestError;
+    type State = ();
+
+    fn init(&self) -> std::result::Result<Self::State, Self::Error> {
+        Ok(())
+    }
+
+    fn process(
+        &self,
+        _state: &mut Self::State,
+        input: Self::Input,
+        ctx: &mut StageContext<Self::Output, Self::Error>,
+    ) -> std::result::Result<(), Self::Error> {
+        ctx.emit(input);
+        Ok(())
+    }
+}
+
 #[test]
-fn piper_streams_outputs_and_drains_on_shutdown() {
+fn associated_type_stages_stream_outputs_and_default_cleanup_is_optional() {
     let piper = Piper::<u32, String, TestError>::start(
         config(),
-        vec![
-            inline_stage_no_cleanup(
-                "double",
-                || -> std::result::Result<(), TestError> { Ok(()) },
-                |_state: &mut (), input: u32, ctx: &mut StageContext<u32, TestError>| {
-                    ctx.emit(input * 2);
-                    Ok(())
-                },
-            ),
-            inline_stage_no_cleanup(
-                "format",
-                || -> std::result::Result<(), TestError> { Ok(()) },
-                |_state: &mut (), input: u32, ctx: &mut StageContext<String, TestError>| {
-                    ctx.emit(format!("value={input}"));
-                    Ok(())
-                },
-            ),
-        ],
+        vec![stage("double", Double), stage("format", FormatValue)],
     )
     .unwrap();
 
@@ -66,45 +120,28 @@ fn piper_streams_outputs_and_drains_on_shutdown() {
 }
 
 #[test]
-fn snapshot_reports_operational_state() {
+fn get_telemetry_reports_operational_state() {
     let piper = Piper::<u32, u32, TestError>::start(
         config(),
-        vec![
-            inline_stage_no_cleanup(
-                "left",
-                || -> std::result::Result<(), TestError> { Ok(()) },
-                |_state: &mut (), input: u32, ctx: &mut StageContext<u32, TestError>| {
-                    ctx.emit(input);
-                    Ok(())
-                },
-            ),
-            inline_stage_no_cleanup(
-                "right",
-                || -> std::result::Result<(), TestError> { Ok(()) },
-                |_state: &mut (), input: u32, ctx: &mut StageContext<u32, TestError>| {
-                    ctx.emit(input);
-                    Ok(())
-                },
-            ),
-        ],
+        vec![stage("left", Pass), stage("right", Pass)],
     )
     .unwrap();
 
     std::thread::sleep(Duration::from_millis(20));
-    let snapshot = piper.snapshot();
+    let telemetry = piper.get_telemetry();
 
-    assert_eq!(snapshot.links.len(), 3);
-    assert_eq!(snapshot.stages.len(), 2);
-    assert_eq!(snapshot.stages[0].active_threads, 1);
-    assert_eq!(snapshot.stages[1].active_threads, 1);
-    assert!(snapshot.parked_threads >= 2);
+    assert_eq!(telemetry.links.len(), 3);
+    assert_eq!(telemetry.stages.len(), 2);
+    assert_eq!(telemetry.stages[0].active_threads, 1);
+    assert_eq!(telemetry.stages[1].active_threads, 1);
+    assert!(telemetry.parked_threads >= 2);
 
     piper.abort();
     piper.join().unwrap();
 }
 
 #[test]
-fn abort_skips_cleanup() {
+fn abort_skips_inline_builder_cleanup() {
     let cleaned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cleaned_for_stage = std::sync::Arc::clone(&cleaned);
 
@@ -113,18 +150,21 @@ fn abort_skips_cleanup() {
             compute_stage: 0,
             ..config()
         },
-        vec![piper::inline_stage(
-            "cleanup",
-            || -> std::result::Result<(), TestError> { Ok(()) },
-            |_state: &mut (), input: u32, ctx: &mut StageContext<u32, TestError>| {
-                ctx.emit(input);
-                Ok(())
-            },
-            move |_state| {
+        vec![
+            inline_stage(
+                "cleanup",
+                || -> std::result::Result<(), TestError> { Ok(()) },
+                |_state: &mut (), input: u32, ctx: &mut StageContext<u32, TestError>| {
+                    ctx.emit(input);
+                    Ok(())
+                },
+            )
+            .with_cleanup(move |_state| {
                 cleaned_for_stage.store(true, std::sync::atomic::Ordering::Release);
                 Ok(())
-            },
-        )],
+            })
+            .into_stage_spec(),
+        ],
     )
     .unwrap();
 
@@ -141,17 +181,33 @@ fn user_process_failure_fails_pipeline() {
             compute_stage: 0,
             ..config()
         },
-        vec![inline_stage_no_cleanup(
-            "fail",
-            || -> std::result::Result<(), TestError> { Ok(()) },
-            |_state: &mut (), _input: u32, _ctx: &mut StageContext<u32, TestError>| {
-                Err(TestError::Test)
-            },
-        )],
+        vec![stage("fail", Fail)],
     )
     .unwrap();
 
     piper.sender().send(1).unwrap();
     let error = piper.join().expect_err("process error should fail join");
     assert!(matches!(error, PiperError::UserProcess { .. }));
+}
+
+struct Fail;
+
+impl Stage for Fail {
+    type Input = u32;
+    type Output = u32;
+    type Error = TestError;
+    type State = ();
+
+    fn init(&self) -> std::result::Result<Self::State, Self::Error> {
+        Ok(())
+    }
+
+    fn process(
+        &self,
+        _state: &mut Self::State,
+        _input: Self::Input,
+        _ctx: &mut StageContext<Self::Output, Self::Error>,
+    ) -> std::result::Result<(), Self::Error> {
+        Err(TestError::Test)
+    }
 }
