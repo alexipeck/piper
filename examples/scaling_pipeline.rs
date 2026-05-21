@@ -6,10 +6,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-const BATCH_COUNT: usize = 1_500;
+const BATCH_COUNT: usize = 15_000;
 const BATCH_SIZE: usize = 2_048;
 const COMPUTE_ROUNDS: usize = 12_288;
-const EMIT_ROUNDS: usize = 24_576;
 const TELEMETRY_INTERVAL: Duration = Duration::from_millis(100);
 const MANAGER_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
 const CSV_TELEMETRY_INTERVAL: Duration = MANAGER_SAMPLE_INTERVAL;
@@ -116,7 +115,7 @@ struct Emit;
 
 impl Stage for Emit {
     type Input = BatchLease;
-    type Output = Batch;
+    type Output = BatchLease;
     type Error = ExampleError;
     type State = ();
 
@@ -130,18 +129,7 @@ impl Stage for Emit {
         input: Self::Input,
         ctx: &mut StageContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
-        let mut output = Vec::with_capacity(input.len());
-        for &value in input.iter() {
-            let mut acc = value;
-            for round in 0..EMIT_ROUNDS {
-                acc = acc
-                    .wrapping_add(0xa076_1d64_78bd_642f ^ round as u64)
-                    .rotate_right(((acc >> 3) & 31) as u32)
-                    .wrapping_mul(0xe703_7ed1_a0b4_28db);
-            }
-            output.push(acc);
-        }
-        ctx.emit(output);
+        ctx.emit(input);
         Ok(())
     }
 }
@@ -149,7 +137,7 @@ impl Stage for Emit {
 pipeline! {
     pub struct ScalingPipeline {
         type Input = Batch;
-        type Output = Batch;
+        type Output = BatchLease;
         type Error = ExampleError;
 
         config = config();
@@ -158,19 +146,30 @@ pipeline! {
             Prepare.with_reusable_output(|| Vec::<u64>::with_capacity(BATCH_SIZE)),
             Normalize.with_reusable_output(|| Vec::<u64>::with_capacity(BATCH_SIZE)),
             anchor(Compute)
-                .max_threads(4)
-                .initial_threads(2)
+                .max_threads(max_parallelism())
+                .initial_threads(half_max_parallelism())
                 .with_reusable_output(|| Vec::<u64>::with_capacity(BATCH_SIZE)),
             Emit,
         ];
     }
 }
 
+fn max_parallelism() -> usize {
+    thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn half_max_parallelism() -> usize {
+    max_parallelism().div_ceil(2).max(1)
+}
+
 fn config() -> PiperConfig {
     PiperConfig {
         sample_interval: MANAGER_SAMPLE_INTERVAL,
         poll_interval: Duration::from_millis(5),
-        global_worker_cap: Some(16),
+        global_worker_cap: None,
         csv_telemetry: Some(
             CsvTelemetryConfig::new(format!(
                 "piper_{}.csv",
