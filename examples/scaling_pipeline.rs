@@ -2,6 +2,10 @@ use piper::{
     BufferLease, CsvTelemetryConfig, PiperConfig, Stage, StageContext, StageExt, anchor, pipeline,
 };
 use std::io::{self, Write};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -12,6 +16,7 @@ const COMPUTE_ROUNDS: usize = 12_288;
 const TELEMETRY_INTERVAL: Duration = Duration::from_millis(100);
 const MANAGER_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
 const CSV_TELEMETRY_INTERVAL: Duration = MANAGER_SAMPLE_INTERVAL;
+const OUTPUT_DRAINER_POLL: Duration = Duration::from_millis(5);
 
 type Batch = Vec<u64>;
 type BatchLease = BufferLease<Vec<u64>>;
@@ -165,6 +170,10 @@ fn half_max_parallelism() -> usize {
     max_parallelism().div_ceil(2).max(1)
 }
 
+fn output_drainers() -> usize {
+    max_parallelism().div_ceil(4).max(2)
+}
+
 fn config() -> PiperConfig {
     PiperConfig {
         sample_interval: MANAGER_SAMPLE_INTERVAL,
@@ -187,6 +196,8 @@ fn main() -> piper::Result<(), ExampleError> {
     let piper = ScalingPipeline::start()?;
     let sender = piper.sender();
     let receiver = piper.receiver();
+    let received_batches = Arc::new(AtomicUsize::new(0));
+    let output_drainers = spawn_output_drainers(receiver, Arc::clone(&received_batches));
 
     let producer = thread::spawn(move || {
         for batch_index in 0..BATCH_COUNT {
@@ -198,12 +209,11 @@ fn main() -> piper::Result<(), ExampleError> {
         }
     });
 
-    let mut received_batches = 0usize;
     let mut producer = Some(producer);
     let mut producer_joined = false;
     let mut next_telemetry = Instant::now();
 
-    while received_batches < BATCH_COUNT {
+    while received_batches.load(Ordering::Relaxed) < BATCH_COUNT {
         if !producer_joined && producer.as_ref().is_some_and(|handle| handle.is_finished()) {
             producer
                 .take()
@@ -213,34 +223,55 @@ fn main() -> piper::Result<(), ExampleError> {
             producer_joined = true;
         }
 
-        match receiver.recv_timeout(Duration::from_millis(25)) {
-            Ok(batch) => {
-                received_batches += 1;
-                drop(batch);
-            }
-            Err(piper::RecvOutputError::Timeout) => {}
-            Err(piper::RecvOutputError::Closed) => break,
-            Err(piper::RecvOutputError::TypeMismatch) => {
-                panic!("pipeline output type mismatch");
-            }
-        }
-
         if next_telemetry.elapsed() >= TELEMETRY_INTERVAL {
-            print_progress(received_batches);
+            print_progress(received_batches.load(Ordering::Relaxed));
             next_telemetry = Instant::now();
         }
+
+        thread::sleep(Duration::from_millis(10));
     }
 
-    print_progress(received_batches);
+    print_progress(received_batches.load(Ordering::Relaxed));
     println!();
 
     if let Some(producer) = producer {
         producer.join().expect("producer thread should not panic");
     }
 
+    for drainer in output_drainers {
+        drainer.join().expect("output drainer should not panic");
+    }
+
     piper.shutdown();
     piper.join()?;
     Ok(())
+}
+
+fn spawn_output_drainers(
+    receiver: piper::PiperReceiver<BatchLease>,
+    received_batches: Arc<AtomicUsize>,
+) -> Vec<thread::JoinHandle<()>> {
+    (0..output_drainers())
+        .map(|_| {
+            let receiver = receiver.clone();
+            let received_batches = Arc::clone(&received_batches);
+            thread::spawn(move || {
+                while received_batches.load(Ordering::Relaxed) < BATCH_COUNT {
+                    match receiver.recv_timeout(OUTPUT_DRAINER_POLL) {
+                        Ok(batch) => {
+                            drop(batch);
+                            received_batches.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(piper::RecvOutputError::Timeout) => {}
+                        Err(piper::RecvOutputError::Closed) => break,
+                        Err(piper::RecvOutputError::TypeMismatch) => {
+                            panic!("pipeline output type mismatch");
+                        }
+                    }
+                }
+            })
+        })
+        .collect()
 }
 
 fn print_progress(received_batches: usize) {
