@@ -4,8 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Piper CSV Viewer</title>
-  <!-- Local: use file picker. Served: python -m http.server from repo root, then
-       piper-csv-viewer.html (example CSV embedded). Optional: ?csv=other.csv when served -->
+  <!-- Session (path, CSV data, columns, zoom, etc.) is saved in localStorage and restored on reload. -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
   <style>
     *, *::before, *::after { box-sizing: border-box; }
@@ -30,7 +29,49 @@
       flex-shrink: 0;
     }
     .toolbar label { color: #8b93a1; }
-    .toolbar input[type="file"] { max-width: 220px; }
+    .file-picker {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+    }
+    .file-picker-btn {
+      font-size: 12px;
+      padding: 4px 10px;
+      background: #2a3140;
+      border: 1px solid #3d4656;
+      color: #d8dce3;
+      border-radius: 4px;
+      white-space: nowrap;
+    }
+    .file-picker:hover .file-picker-btn { background: #354052; }
+    .file-picker-input {
+      position: absolute;
+      width: 0;
+      height: 0;
+      opacity: 0;
+      overflow: hidden;
+      pointer-events: none;
+    }
+    .file-picker-name {
+      color: #8b93a1;
+      font-size: 12px;
+      max-width: 200px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .toolbar input[type="text"].csv-path {
+      flex: 1;
+      min-width: 180px;
+      max-width: 480px;
+      padding: 4px 8px;
+      border: 1px solid #3d4656;
+      border-radius: 4px;
+      background: #14161a;
+      color: #d8dce3;
+      font-size: 12px;
+    }
     .toolbar input[type="range"] { width: 140px; }
     .toolbar button {
       background: #2a3140;
@@ -87,6 +128,54 @@
       cursor: pointer;
     }
     .sidebar-actions button:hover { background: #354052; }
+    .mini-btn {
+      font-size: 11px;
+      padding: 2px 6px;
+      background: #2a3140;
+      border: 1px solid #3d4656;
+      color: #d8dce3;
+      border-radius: 4px;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .mini-btn:hover { background: #354052; }
+    .word-groups {
+      border-bottom: 1px solid #2a2f38;
+      max-height: 200px;
+      overflow-y: auto;
+      padding: 6px 8px;
+      flex-shrink: 0;
+    }
+    .word-groups-title {
+      font-size: 11px;
+      color: #8b93a1;
+      margin-bottom: 6px;
+    }
+    .word-group-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 0;
+      font-size: 11px;
+    }
+    .word-group-row.hidden-filter { display: none; }
+    .word-group-label {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: #d8dce3;
+    }
+    .word-group-count {
+      color: #6b7280;
+      flex-shrink: 0;
+    }
+    .word-group-actions {
+      display: flex;
+      gap: 4px;
+      flex-shrink: 0;
+    }
     .column-list {
       flex: 1;
       overflow-y: auto;
@@ -133,6 +222,48 @@
       font-size: 12px;
     }
     .chart-head label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+    .chart-head button {
+      background: #2a3140;
+      border: 1px solid #3d4656;
+      color: #d8dce3;
+      padding: 4px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 11px;
+    }
+    .chart-head button:hover:not(:disabled) { background: #354052; }
+    .chart-head button:disabled {
+      opacity: 0.45;
+      cursor: default;
+    }
+    .chart-head .chart-hint {
+      color: #6b7280;
+      font-size: 11px;
+    }
+    .chart-wrap .u-select {
+      background: rgba(126, 184, 255, 0.14);
+      border: 1px solid rgba(126, 184, 255, 0.55);
+    }
+    .chart-head .y-range {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-left: auto;
+      flex-wrap: wrap;
+    }
+    .chart-head .y-range input[type="number"] {
+      width: 72px;
+      padding: 4px 6px;
+      border: 1px solid #3d4656;
+      border-radius: 4px;
+      background: #14161a;
+      color: #d8dce3;
+      font-variant-numeric: tabular-nums;
+    }
+    .chart-head .y-range .y-range-hint {
+      color: #6b7280;
+      font-size: 11px;
+    }
     .chart-wrap {
       flex: 1;
       min-height: 0;
@@ -255,8 +386,14 @@
 </head>
 <body>
   <div class="toolbar" id="toolbar">
-    <input type="file" id="fileInput" accept=".csv,text/csv">
-    <span class="drop-hint" id="dropHint">Drop CSV or pick file to replace embedded example</span>
+    <label class="file-picker">
+      <span class="file-picker-btn">Choose file</span>
+      <input type="file" id="fileInput" class="file-picker-input" accept=".csv,text/csv">
+      <span class="file-picker-name" id="fileInputLabel">No file chosen</span>
+    </label>
+    <input type="text" class="csv-path" id="csvPathInput" placeholder="C:\full\path\to\file.csv">
+    <button type="button" id="csvPathLoad">Load path</button>
+    <span class="drop-hint" id="dropHint">Session auto-saves to browser storage on reload</span>
     <label><input type="checkbox" id="logScale"> Log Y</label>
     <label><input type="checkbox" id="showAllRows" checked> Show all rows</label>
     <button type="button" id="prevRow" disabled>&larr;</button>
@@ -274,12 +411,28 @@
           <button type="button" id="selectNone" disabled>None</button>
         </div>
       </div>
+      <div class="word-groups" id="wordGroups" hidden>
+        <div class="word-groups-title">Groups by word</div>
+        <div class="word-groups-list" id="wordGroupsList"></div>
+      </div>
       <div class="column-list" id="columnList"></div>
     </aside>
     <div class="main">
       <section class="chart-section" id="chartSection">
         <div class="chart-head">
-          <span>Graph — X: elapsed_ms · check columns in sidebar to plot</span>
+          <span>Graph — drag to zoom X (elapsed_ms)</span>
+          <button type="button" id="xZoomReset" disabled>Reset X zoom</button>
+          <span class="chart-hint" id="xZoomHint"></span>
+          <div class="y-range">
+            <span>Y min</span>
+            <input type="text" id="yMinOverride" inputmode="decimal" placeholder="auto" disabled>
+            <span>Y max</span>
+            <input type="text" id="yMaxOverride" inputmode="decimal" placeholder="auto" disabled>
+            <button type="button" id="yRangeFromData" disabled>From data</button>
+            <button type="button" id="yRangeApply" disabled>Apply</button>
+            <button type="button" id="yRangeAuto" disabled>Auto</button>
+            <span class="y-range-hint" id="yRangeHint"></span>
+          </div>
         </div>
         <div class="chart-wrap" id="chartWrap">
           <p class="empty-state" id="chartEmpty">Load CSV and select numeric columns to graph.</p>
@@ -302,50 +455,6 @@
       </div>
     </div>
   </div>
-  <script type="text/csv" id="embeddedCsv">
-elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_threads,anchor_index,anchor_name,anchor_active_threads,anchor_max_threads,anchor_probe_state,anchor_effective_probe_interval_ms,anchor_last_probe_outcome,link0_len,link0_state,link1_len,link1_state,link2_len,link2_state,link3_len,link3_state,link4_len,link4_state,stage0_name,stage0_active_threads,stage0_processed_count,stage0_busy_ratio,stage0_busy_ceiling,stage0_effective_add_dwell_ms,stage0_effective_remove_dwell_ms,stage0_scaling_state,stage0_is_anchor,stage1_name,stage1_active_threads,stage1_processed_count,stage1_busy_ratio,stage1_busy_ceiling,stage1_effective_add_dwell_ms,stage1_effective_remove_dwell_ms,stage1_scaling_state,stage1_is_anchor,stage2_name,stage2_active_threads,stage2_processed_count,stage2_busy_ratio,stage2_busy_ceiling,stage2_effective_add_dwell_ms,stage2_effective_remove_dwell_ms,stage2_scaling_state,stage2_is_anchor,stage3_name,stage3_active_threads,stage3_processed_count,stage3_busy_ratio,stage3_busy_ceiling,stage3_effective_add_dwell_ms,stage3_effective_remove_dwell_ms,stage3_scaling_state,stage3_is_anchor
-250.304,false,false,false,4,2,Compute,3,4,Probing,100.000,None,0,Starved,0,Starved,1471,AboveHighWater,21,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,3,26,0.999996,0.996666,40.000,500.000,Probing,true,Emit,1,4,0.999998,0.759897,40.000,500.000,Eligible,false
-500.743,false,false,true,4,2,Compute,2,4,BackingOff,200.000,Reverted,0,Starved,0,Starved,1448,AboveHighWater,27,AboveHighWater,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,2,49,0.999996,0.998364,80.000,1000.000,BackingOff,true,Emit,7,16,0.999997,0.987493,40.000,500.000,Eligible,false
-751.265,false,false,false,4,2,Compute,3,4,Probing,200.000,Reverted,0,Starved,0,Starved,1421,AboveHighWater,15,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,3,75,0.999992,0.999954,160.000,2000.000,Probing,true,Emit,8,53,0.999997,0.999990,40.000,500.000,Eligible,false
-1001.428,false,false,false,4,2,Compute,4,4,Probing,150.000,Kept,0,Starved,0,Starved,1391,AboveHighWater,5,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,104,0.999993,0.999991,160.000,2000.000,Probing,true,Emit,8,92,0.999998,0.999996,40.000,500.000,Eligible,false
-1251.802,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,1352,AboveHighWater,6,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,143,0.999994,0.999993,160.000,2000.000,BackingOff,true,Emit,8,130,0.999998,0.999997,40.000,500.000,Eligible,false
-1502.223,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,1315,AboveHighWater,4,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,180,0.999984,0.999984,70.502,881.280,Eligible,true,Emit,8,169,0.999997,0.999996,40.000,500.000,Eligible,false
-1752.312,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,1275,AboveHighWater,8,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,220,0.999994,0.999991,42.433,530.413,Eligible,true,Emit,8,205,0.999997,0.999995,40.000,500.000,Eligible,false
-2002.526,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,1237,AboveHighWater,8,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,258,0.999996,0.999992,40.194,502.426,Eligible,true,Emit,8,243,0.999998,0.999997,40.000,500.000,Eligible,false
-2252.740,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,1196,AboveHighWater,10,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,299,0.999995,0.999993,40.014,500.174,Eligible,true,Emit,8,282,0.999998,0.999997,40.000,500.000,Eligible,false
-2502.918,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,1159,AboveHighWater,9,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,336,0.999992,0.999992,40.001,500.014,Eligible,true,Emit,8,320,0.999998,0.999996,40.000,500.000,Eligible,false
-2753.418,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,1119,AboveHighWater,11,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,376,0.999992,0.999992,40.000,500.001,Eligible,true,Emit,8,358,0.999996,0.999996,40.000,500.000,Eligible,false
-3003.763,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,1080,AboveHighWater,11,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,415,0.999995,0.999993,40.000,500.000,Eligible,true,Emit,8,397,0.999996,0.999996,40.000,500.000,Eligible,false
-3254.191,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,1043,AboveHighWater,9,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,452,0.999992,0.999987,40.000,500.000,Eligible,true,Emit,8,436,0.999996,0.999992,40.000,500.000,Eligible,false
-3504.552,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,1002,AboveHighWater,13,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,493,0.999992,0.999992,40.000,500.000,Eligible,true,Emit,8,473,0.999998,0.999997,40.000,500.000,Eligible,false
-3754.773,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,964,AboveHighWater,12,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,531,0.999993,0.999988,40.000,500.000,Eligible,true,Emit,8,512,0.999995,0.999995,40.000,500.000,Eligible,false
-4005.191,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,924,AboveHighWater,15,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,571,0.999991,0.999991,40.000,500.000,Eligible,true,Emit,8,549,0.999997,0.999992,40.000,500.000,Eligible,false
-4255.452,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,886,AboveHighWater,14,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,609,0.999990,0.999990,40.000,500.000,Eligible,true,Emit,8,588,0.999998,0.999997,40.000,500.000,Eligible,false
-4505.606,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,848,AboveHighWater,13,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,647,0.999992,0.999992,40.000,500.000,Eligible,true,Emit,8,627,0.999996,0.999996,40.000,500.000,Eligible,false
-4755.696,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,810,AboveHighWater,13,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,685,0.999990,0.999989,40.000,500.000,Eligible,true,Emit,8,665,0.999996,0.999996,40.000,500.000,Eligible,false
-5005.801,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,771,AboveHighWater,15,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,724,0.999993,0.999988,40.000,500.000,Eligible,true,Emit,8,702,0.999999,0.999997,40.000,500.000,Eligible,false
-5256.330,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,734,AboveHighWater,14,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,761,0.999992,0.999992,40.000,500.000,Eligible,true,Emit,8,740,0.999996,0.999996,40.000,500.000,Eligible,false
-5506.462,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,694,AboveHighWater,15,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,801,0.999988,0.999988,40.000,500.000,Eligible,true,Emit,8,779,0.999996,0.999996,40.000,500.000,Eligible,false
-5756.698,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,656,AboveHighWater,17,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,839,0.999992,0.999992,40.000,500.000,Eligible,true,Emit,8,815,0.999997,0.999997,40.000,500.000,Eligible,false
-6007.101,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,618,AboveHighWater,17,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,877,0.999992,0.999991,40.000,500.000,Eligible,true,Emit,8,853,0.999996,0.999996,40.000,500.000,Eligible,false
-6257.537,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,579,AboveHighWater,16,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,916,0.999996,0.999994,40.000,500.000,Eligible,true,Emit,8,893,0.999996,0.999996,40.000,500.000,Eligible,false
-6507.836,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,539,AboveHighWater,17,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,956,0.999994,0.999994,40.000,500.000,Eligible,true,Emit,8,932,0.999997,0.999997,40.000,500.000,Eligible,false
-6758.104,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,499,AboveHighWater,21,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,996,0.999990,0.999990,40.000,500.000,Eligible,true,Emit,8,968,0.999998,0.999997,40.000,500.000,Eligible,false
-7008.220,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,462,AboveHighWater,20,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1033,0.999993,0.999992,40.000,500.000,Eligible,true,Emit,8,1006,0.999998,0.999996,40.000,500.000,Eligible,false
-7258.508,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,422,AboveHighWater,22,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1073,0.999992,0.999992,40.000,500.000,Eligible,true,Emit,8,1044,0.999997,0.999996,40.000,500.000,Eligible,false
-7509.051,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,384,AboveHighWater,22,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1111,0.999992,0.999992,40.000,500.000,Eligible,true,Emit,8,1082,0.999994,0.999994,40.000,500.000,Eligible,false
-7759.209,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,343,AboveHighWater,23,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1152,0.999990,0.999990,40.000,500.000,Eligible,true,Emit,8,1122,0.999998,0.999996,40.000,500.000,Eligible,false
-8009.419,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,305,AboveHighWater,23,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1190,0.999992,0.999991,40.000,500.000,Eligible,true,Emit,8,1160,0.999997,0.999996,40.000,500.000,Eligible,false
-8259.745,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,266,AboveHighWater,23,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1229,0.999996,0.999993,40.000,500.000,Eligible,true,Emit,8,1199,0.999998,0.999997,40.000,500.000,Eligible,false
-8509.929,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,228,AboveHighWater,25,AboveHighWater,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1267,0.999992,0.999993,40.000,500.000,Eligible,true,Emit,8,1235,0.999998,0.999998,40.000,500.000,Eligible,false
-8760.395,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,189,AboveHighWater,25,AboveHighWater,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1306,0.999996,0.999992,40.000,500.000,Eligible,true,Emit,8,1274,0.999998,0.999997,40.000,500.000,Eligible,false
-9010.680,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,150,AboveHighWater,25,AboveHighWater,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1345,0.999990,0.999994,40.000,500.000,Eligible,true,Emit,9,1312,0.999998,0.999997,40.000,500.000,Eligible,false
-9260.830,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,110,AboveHighWater,19,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1385,0.999994,0.999993,40.000,500.000,Eligible,true,Emit,9,1358,0.999997,0.999996,40.000,500.000,Eligible,false
-9511.080,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,73,AboveHighWater,13,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1422,0.999992,0.999992,40.000,500.000,Eligible,true,Emit,9,1401,0.999996,0.999996,40.000,500.000,Eligible,false
-9761.171,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,34,AboveHighWater,10,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1461,0.999994,0.999994,40.000,500.000,Eligible,true,Emit,9,1443,0.999998,0.999997,40.000,500.000,Eligible,false
-10011.262,false,false,false,4,2,Compute,4,4,AtMax,112.500,Kept,0,Starved,0,Starved,0,Starved,5,Nominal,0,Starved,Prepare,1,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,1,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,4,1499,0.668622,0.999937,40.000,500.000,Eligible,true,Emit,9,1486,0.999998,0.999995,40.000,500.000,Eligible,false
-10261.677,true,false,false,0,2,Compute,0,4,Eligible,112.500,Kept,0,Starved,0,Starved,0,Starved,0,Starved,0,Starved,Prepare,0,1500,0.000000,0.000000,40.000,500.000,Eligible,false,Normalize,0,1500,0.000000,0.295719,40.000,500.000,Eligible,false,Compute,0,1499,0.000000,0.999937,40.000,500.000,Eligible,true,Emit,0,1500,0.320776,0.999996,40.000,500.000,Eligible,false
-</script>
   <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
   <script>
     const CHART_COLORS = [
@@ -360,12 +469,102 @@ elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_thr
       selectedRowIndex: 0,
       showAllRows: true,
       searchQuery: "",
+      wordGroups: [],
       logScale: false,
+      yMin: null,
+      yMax: null,
+      xFullMin: null,
+      xFullMax: null,
+      xZoomMin: null,
+      xZoomMax: null,
       plot: null,
       syncingCursor: false,
+      csvPath: null,
     };
 
+    let storageApplyDepth = 0;
+    let storageSaveTimer = null;
+    let lastLoadedCsvText = null;
+    const STORAGE_KEY = "piperViewerSave";
+
+    function pathKey(path) {
+      return (path || "").trim().replace(/\\/g, "/").toLowerCase();
+    }
+
+    function buildConfigFromState() {
+      if (state.headers.length === 0) return null;
+      const cfg = {};
+      const visibleNames = state.headers.filter((h, i) => state.visible[i]);
+      if (visibleNames.length === state.headers.length) cfg.cols = "all";
+      else if (visibleNames.length === 0) cfg.cols = "none";
+      else cfg.cols = visibleNames;
+      if (state.logScale) cfg.log = true;
+      if (state.showAllRows) cfg.allRows = true;
+      if (state.selectedRowIndex > 0) cfg.row = state.selectedRowIndex;
+      if (state.searchQuery) cfg.q = state.searchQuery;
+      if (state.yMin != null) cfg.ymin = state.yMin;
+      if (state.yMax != null) cfg.ymax = state.yMax;
+      if (hasXZoom()) {
+        cfg.xmin = state.xZoomMin;
+        cfg.xmax = state.xZoomMax;
+      }
+      return Object.keys(cfg).length > 0 ? cfg : null;
+    }
+
+    function loadSavedState() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        return raw ? JSON.parse(raw) : null;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function persistToStorage() {
+      if (storageApplyDepth > 0 || !lastLoadedCsvText) return;
+      const path = (state.csvPath || csvPathInput.value || "").trim() || null;
+      try {
+        localStorage.setItem(
+          STORAGE_KEY,
+          JSON.stringify({
+            csvPath: path,
+            csvText: lastLoadedCsvText,
+            config: buildConfigFromState(),
+          })
+        );
+      } catch (_) {
+        statusEl.textContent =
+          (statusEl.textContent ? statusEl.textContent + " — " : "") +
+          "Could not save session (browser storage may be full).";
+      }
+    }
+
+    function scheduleStorageSave() {
+      if (storageApplyDepth > 0) return;
+      clearTimeout(storageSaveTimer);
+      storageSaveTimer = setTimeout(persistToStorage, 150);
+    }
+
+    function updateFileLabel() {
+      const path =
+        state.csvPath ||
+        csvPathInput.value.trim() ||
+        fileInput.files?.[0]?.name ||
+        "";
+      if (!path) {
+        fileInputLabel.textContent = "No file chosen";
+        fileInputLabel.title = "";
+        return;
+      }
+      const base = path.replace(/^.*[/\\]/, "") || path;
+      fileInputLabel.textContent = base;
+      fileInputLabel.title = path;
+    }
+
     const fileInput = document.getElementById("fileInput");
+    const fileInputLabel = document.getElementById("fileInputLabel");
+    const csvPathInput = document.getElementById("csvPathInput");
+    const csvPathLoad = document.getElementById("csvPathLoad");
     const dropHint = document.getElementById("dropHint");
     const logScaleEl = document.getElementById("logScale");
     const showAllRowsEl = document.getElementById("showAllRows");
@@ -374,6 +573,14 @@ elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_thr
     const chartEmpty = document.getElementById("chartEmpty");
     const chartLegend = document.getElementById("chartLegend");
     const chartSection = document.getElementById("chartSection");
+    const yMinOverride = document.getElementById("yMinOverride");
+    const yMaxOverride = document.getElementById("yMaxOverride");
+    const yRangeFromData = document.getElementById("yRangeFromData");
+    const yRangeApply = document.getElementById("yRangeApply");
+    const yRangeAuto = document.getElementById("yRangeAuto");
+    const yRangeHint = document.getElementById("yRangeHint");
+    const xZoomReset = document.getElementById("xZoomReset");
+    const xZoomHint = document.getElementById("xZoomHint");
     const rowSlider = document.getElementById("rowSlider");
     const prevRow = document.getElementById("prevRow");
     const nextRow = document.getElementById("nextRow");
@@ -383,6 +590,8 @@ elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_thr
     const selectAllBtn = document.getElementById("selectAll");
     const selectNoneBtn = document.getElementById("selectNone");
     const columnList = document.getElementById("columnList");
+    const wordGroupsEl = document.getElementById("wordGroups");
+    const wordGroupsList = document.getElementById("wordGroupsList");
     const tableWrap = document.getElementById("tableWrap");
     const emptyState = document.getElementById("emptyState");
     const dataTable = document.getElementById("dataTable");
@@ -462,16 +671,214 @@ elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_thr
       return state.headers.map(() => true);
     }
 
-    function loadCsvText(text, name) {
+    function applySavedConfigUiOnly(cfg) {
+      if (!cfg) return;
+      storageApplyDepth++;
+      try {
+        if (cfg.log != null) {
+          state.logScale = cfg.log;
+          logScaleEl.checked = cfg.log;
+        }
+        if (cfg.allRows != null) {
+          state.showAllRows = cfg.allRows;
+          showAllRowsEl.checked = cfg.allRows;
+        }
+        if (cfg.q != null) {
+          state.searchQuery = cfg.q;
+          columnSearch.value = cfg.q;
+        }
+        if (cfg.ymin != null || cfg.ymax != null) {
+          state.yMin = cfg.ymin ?? null;
+          state.yMax = cfg.ymax ?? null;
+          yMinOverride.value = cfg.ymin != null ? String(cfg.ymin) : "";
+          yMaxOverride.value = cfg.ymax != null ? String(cfg.ymax) : "";
+        }
+      } finally {
+        storageApplyDepth--;
+      }
+    }
+
+    function applySavedConfig(cfg) {
+      if (!cfg || state.headers.length === 0) return;
+      storageApplyDepth++;
+      try {
+        if (cfg.cols === "all") {
+          state.visible = state.headers.map(() => true);
+        } else if (cfg.cols === "none") {
+          state.visible = state.headers.map(() => false);
+        } else if (Array.isArray(cfg.cols)) {
+          const set = new Set(cfg.cols);
+          state.visible = state.headers.map((h) => set.has(h));
+        }
+        if (cfg.log != null) {
+          state.logScale = cfg.log;
+          logScaleEl.checked = cfg.log;
+        }
+        if (cfg.allRows != null) {
+          state.showAllRows = cfg.allRows;
+          showAllRowsEl.checked = cfg.allRows;
+        }
+        if (cfg.q != null) {
+          state.searchQuery = cfg.q;
+          columnSearch.value = cfg.q;
+        }
+        if (cfg.ymin != null || cfg.ymax != null) {
+          state.yMin = cfg.ymin ?? null;
+          state.yMax = cfg.ymax ?? null;
+          yMinOverride.value = cfg.ymin != null ? String(cfg.ymin) : "";
+          yMaxOverride.value = cfg.ymax != null ? String(cfg.ymax) : "";
+          yRangeHint.textContent = hasYRangeLock() ? formatYRangeHint() : "";
+        }
+        if (cfg.xmin != null && cfg.xmax != null && cfg.xmax > cfg.xmin) {
+          state.xZoomMin = cfg.xmin;
+          state.xZoomMax = cfg.xmax;
+        }
+        syncColumnCheckboxes();
+        applyColumnFilter();
+        if (cfg.row != null && state.rows.length > 0) {
+          const ri = Math.max(0, Math.min(cfg.row, state.rows.length - 1));
+          state.selectedRowIndex = ri;
+          rowSlider.value = String(ri);
+        }
+        updateRowControls();
+        renderAll();
+      } finally {
+        storageApplyDepth--;
+      }
+      scheduleStorageSave();
+    }
+
+    function isFullFilesystemPath(p) {
+      if (!p) return false;
+      return (
+        /^file:\/\//i.test(p) ||
+        /^[a-zA-Z]:[\\/]/.test(p) ||
+        p.startsWith("\\\\") ||
+        (p.startsWith("/") && p.length > 1)
+      );
+    }
+
+    function encodeFilePathSegment(seg) {
+      if (seg === "") return "";
+      if (/^[a-zA-Z]:$/.test(seg)) return seg;
+      return encodeURIComponent(seg);
+    }
+
+    function slashPathToFileUrl(slashPath) {
+      const encoded = slashPath
+        .split("/")
+        .map(encodeFilePathSegment)
+        .join("/");
+      if (/^\/[a-zA-Z]:\//.test(slashPath) || /^\/[a-zA-Z]:$/.test(slashPath)) {
+        return "file://" + encoded;
+      }
+      if (slashPath.startsWith("//")) return "file:" + encoded;
+      return "file://" + encoded;
+    }
+
+    function resolveCsvFetchUrl(pathParam) {
+      const trimmed = pathParam.trim();
+      if (!trimmed) return null;
+      if (/^file:\/\//i.test(trimmed)) {
+        try {
+          return new URL(trimmed).href;
+        } catch {
+          return slashPathToFileUrl(trimmed.replace(/^file:\/\//i, "/"));
+        }
+      }
+      let slashPath = trimmed.replace(/\\/g, "/");
+      if (/^[a-zA-Z]:/.test(slashPath)) slashPath = "/" + slashPath;
+      else if (trimmed.startsWith("\\\\")) {
+        slashPath = "//" + trimmed.slice(2).replace(/\\/g, "/");
+      } else if (!slashPath.startsWith("/")) {
+        try {
+          return new URL(trimmed, location.href).href;
+        } catch {
+          return null;
+        }
+      }
+      return slashPathToFileUrl(slashPath);
+    }
+
+    function csvFetchTargets(pathParam) {
+      const targets = [];
+      const seen = new Set();
+      const add = (u) => {
+        if (u && !seen.has(u)) {
+          seen.add(u);
+          targets.push(u);
+        }
+      };
+      add(resolveCsvFetchUrl(pathParam));
+      if (!isFullFilesystemPath(pathParam) && !pathParam.includes("/") && !pathParam.includes("\\")) {
+        try {
+          add(new URL(pathParam, location.href).href);
+        } catch (_) {}
+      }
+      return targets;
+    }
+
+    function localFileAccessHint() {
+      if (location.protocol !== "file:") return "";
+      return " From file://, Chromium may need --allow-file-access-from-files, or place the CSV next to this HTML file.";
+    }
+
+    function loadCsvFromPath(pathParam, savedConfig) {
+      const path = pathParam.trim();
+      if (!path) return;
+      state.csvPath = path;
+      csvPathInput.value = path;
+      const saved = loadSavedState();
+      if (saved?.csvText && saved.csvPath && pathKey(saved.csvPath) === pathKey(path)) {
+        const cfg = savedConfig !== undefined ? savedConfig : saved.config;
+        loadCsvText(saved.csvText, path, cfg);
+        return;
+      }
+      const targets = csvFetchTargets(path);
+      const tryNext = (i) => {
+        if (i >= targets.length) {
+          statusEl.textContent = `Could not load: ${path}.${localFileAccessHint()}`;
+          return;
+        }
+        fetch(targets[i])
+          .then((r) => {
+            if (!r.ok) throw new Error(r.statusText);
+            return r.text();
+          })
+          .then((text) => loadCsvText(text, path, savedConfig))
+          .catch(() => tryNext(i + 1));
+      };
+      tryNext(0);
+    }
+
+    function loadCsvText(text, name, savedConfig) {
+      lastLoadedCsvText = text;
       const { headers, rows } = parseCsv(text);
       state.headers = headers;
       state.rows = rows;
+      const pathLabel = (name || "").trim() || state.csvPath || "saved.csv";
+      state.csvPath = pathLabel;
+      csvPathInput.value = pathLabel;
       state.visible = defaultVisible();
       state.selectedRowIndex = rows.length > 0 ? 0 : -1;
-      statusEl.textContent = `${name}: ${rows.length} rows, ${headers.length} columns`;
+      state.yMin = null;
+      state.yMax = null;
+      state.xZoomMin = null;
+      state.xZoomMax = null;
+      yMinOverride.value = "";
+      yMaxOverride.value = "";
+      yRangeHint.textContent = "";
+      refreshFullXExtents();
+      updateXZoomUi();
+      statusEl.textContent = `${pathLabel}: ${rows.length} rows, ${headers.length} columns`;
       enableControls(true);
+      buildWordGroups();
+      buildWordGroupPanel();
       buildColumnList();
-      renderAll();
+      if (savedConfig) applySavedConfig(savedConfig);
+      else renderAll();
+      updateFileLabel();
+      persistToStorage();
     }
 
     function renderAll() {
@@ -502,9 +909,206 @@ elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_thr
       return state.rows.map((_, i) => i);
     }
 
+    function refreshFullXExtents() {
+      const x = getXValues();
+      if (x.length === 0) {
+        state.xFullMin = null;
+        state.xFullMax = null;
+        return;
+      }
+      state.xFullMin = Math.min(...x);
+      state.xFullMax = Math.max(...x);
+    }
+
+    function hasXZoom() {
+      return state.xZoomMin != null && state.xZoomMax != null;
+    }
+
+    function updateXZoomUi() {
+      if (!hasXZoom()) {
+        xZoomReset.disabled = state.rows.length === 0;
+        xZoomHint.textContent = "";
+        return;
+      }
+      xZoomReset.disabled = false;
+      const lo = state.xZoomMin;
+      const hi = state.xZoomMax;
+      const fmt = (v) => (v >= 1000 ? `${(v / 1000).toFixed(2)}s` : `${v}ms`);
+      xZoomHint.textContent = `X zoomed: ${fmt(lo)} – ${fmt(hi)}`;
+    }
+
+    function applyXZoomToPlot() {
+      if (!state.plot || !hasXZoom()) return;
+      state.plot.setScale("x", { min: state.xZoomMin, max: state.xZoomMax });
+      applyYRangeToPlot();
+    }
+
+    function resetXZoom() {
+      state.xZoomMin = null;
+      state.xZoomMax = null;
+      if (state.plot && state.xFullMin != null && state.xFullMax != null) {
+        state.plot.setScale("x", { min: state.xFullMin, max: state.xFullMax });
+        state.plot.setSelect({ left: 0, width: 0, top: 0, height: 0 }, false);
+        applyYRangeToPlot();
+      }
+      updateXZoomUi();
+      scheduleStorageSave();
+    }
+
+    function syncXZoomStateFromPlot(u) {
+      const sc = u.scales.x;
+      if (!sc || sc.min == null || sc.max == null) return;
+      if (state.xFullMin == null || state.xFullMax == null) return;
+      const span = state.xFullMax - state.xFullMin;
+      const eps = Math.max(span * 0.0005, 1e-6);
+      const zoomed = sc.min > state.xFullMin + eps || sc.max < state.xFullMax - eps;
+      if (zoomed) {
+        state.xZoomMin = sc.min;
+        state.xZoomMax = sc.max;
+      } else {
+        state.xZoomMin = null;
+        state.xZoomMax = null;
+      }
+      updateXZoomUi();
+      scheduleStorageSave();
+    }
+
     function chartSeriesIndices() {
       const xi = xAxisIndex();
       return visibleColumnIndices().filter((ci) => ci !== xi && isNumericColumn(ci));
+    }
+
+    function plottedValueExtents() {
+      const series = chartSeriesIndices();
+      let min = Infinity;
+      let max = -Infinity;
+      for (const ci of series) {
+        for (const row of state.rows) {
+          const n = Number(row[ci]);
+          if (!Number.isFinite(n)) continue;
+          if (n < min) min = n;
+          if (n > max) max = n;
+        }
+      }
+      if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
+      if (min === max) {
+        const pad = Math.abs(min) * 0.05 || 1;
+        return { min: min - pad, max: max + pad };
+      }
+      const pad = (max - min) * 0.02;
+      return { min: min - pad, max: max + pad };
+    }
+
+    function parseAxisInput(el) {
+      const raw = el.value.trim();
+      if (raw === "") return null;
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    function readYRangeInputs() {
+      return {
+        ymin: parseAxisInput(yMinOverride),
+        ymax: parseAxisInput(yMaxOverride),
+      };
+    }
+
+    function hasYRangeLock() {
+      return state.yMin != null || state.yMax != null;
+    }
+
+    function effectiveYRange() {
+      const ext = plottedValueExtents();
+      const dMin = ext ? ext.min : 0;
+      const dMax = ext ? ext.max : 1;
+      const lo = state.yMin != null ? state.yMin : dMin;
+      const hi = state.yMax != null ? state.yMax : dMax;
+      if (!Number.isFinite(lo) || !Number.isFinite(hi) || lo >= hi) return null;
+      return [lo, hi];
+    }
+
+    function yRangeFn(_u, dataMin, dataMax) {
+      if (hasYRangeLock()) {
+        const locked = effectiveYRange();
+        if (locked) return locked;
+      }
+      const lo = dataMin != null && Number.isFinite(dataMin) ? dataMin : 0;
+      const hi = dataMax != null && Number.isFinite(dataMax) ? dataMax : lo + 1;
+      return lo < hi ? [lo, hi] : [hi - 1, hi];
+    }
+
+    function yAutoFn() {
+      return !hasYRangeLock();
+    }
+
+    function buildYScaleOpts() {
+      const y = {
+        auto: yAutoFn,
+        range: yRangeFn,
+      };
+      if (state.logScale) y.distr = 3;
+      return y;
+    }
+
+    function applyYRangeToPlot() {
+      if (!state.plot || !hasYRangeLock()) return;
+      const r = effectiveYRange();
+      if (!r) return;
+      const y = state.plot.scales.y;
+      y.auto = yAutoFn;
+      y.range = yRangeFn;
+      state.plot.setScale("y", { min: r[0], max: r[1] });
+    }
+
+    function formatYRangeHint() {
+      const r = effectiveYRange();
+      if (!r) return "Invalid Y range.";
+      return `Y axis locked: ${r[0]} … ${r[1]}`;
+    }
+
+    function applyYRangeFromInputs() {
+      const { ymin, ymax } = readYRangeInputs();
+      if (ymin == null && ymax == null) {
+        yRangeHint.textContent = "Enter Y min and/or Y max.";
+        return false;
+      }
+      if (ymin != null && ymax != null && ymin >= ymax) {
+        yRangeHint.textContent = "Y min must be less than Y max.";
+        return false;
+      }
+      if (state.logScale && ymin != null && ymin <= 0) {
+        yRangeHint.textContent = "Log scale requires Y min > 0.";
+        return false;
+      }
+      state.yMin = ymin;
+      state.yMax = ymax;
+      const r = effectiveYRange();
+      if (!r) {
+        yRangeHint.textContent = "Could not resolve Y range for current series.";
+        return false;
+      }
+      if (state.logScale && r[0] <= 0) {
+        yRangeHint.textContent = "Log scale requires Y min > 0.";
+        return false;
+      }
+      if (state.plot && chartSeriesIndices().length > 0) {
+        applyYRangeToPlot();
+      } else {
+        renderChart();
+      }
+      yRangeHint.textContent = formatYRangeHint();
+      scheduleStorageSave();
+      return true;
+    }
+
+    function clearYRangeOverride() {
+      state.yMin = null;
+      state.yMax = null;
+      yMinOverride.value = "";
+      yMaxOverride.value = "";
+      yRangeHint.textContent = "Y axis auto-scales to data.";
+      renderChart();
+      scheduleStorageSave();
     }
 
     function renderChartLegend(series) {
@@ -540,6 +1144,7 @@ elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_thr
       const x = getXValues();
       const data = [x];
       const seriesOpts = [{}];
+      const yLocked = hasYRangeLock();
       series.forEach((ci, si) => {
         data.push(
           state.rows.map((r) => {
@@ -551,16 +1156,21 @@ elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_thr
           label: state.headers[ci],
           stroke: CHART_COLORS[si % CHART_COLORS.length],
           width: 2,
+          auto: !yLocked,
         });
       });
 
       const w = Math.max(chartWrap.clientWidth - 16, 320);
       const h = Math.max(chartWrap.clientHeight - 8, 160);
+      const scales = {
+        x: { time: false },
+        y: buildYScaleOpts(),
+      };
       const opts = {
         width: w,
         height: h,
         series: seriesOpts,
-        scales: state.logScale ? { y: { distr: 3 } } : {},
+        scales,
         axes: [
           {
             stroke: "#8b93a1",
@@ -573,11 +1183,34 @@ elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_thr
             grid: { stroke: "#2a2f38" },
           },
         ],
+        select: {
+          show: true,
+          over: true,
+          fill: "rgba(126, 184, 255, 0.14)",
+          stroke: "rgba(126, 184, 255, 0.55)",
+        },
         cursor: {
-          drag: { x: false, y: false },
+          drag: { x: true, y: false, setScale: true },
           points: { size: 5, stroke: "#d8dce3", fill: "#14161a" },
         },
         hooks: {
+          ready: [
+            (u) => {
+              if (hasXZoom()) applyXZoomToPlot();
+              else if (state.xFullMin != null && state.xFullMax != null) {
+                u.setScale("x", { min: state.xFullMin, max: state.xFullMax });
+              }
+              if (hasYRangeLock()) applyYRangeToPlot();
+              syncXZoomStateFromPlot(u);
+            },
+          ],
+          setScale: [
+            (u, key) => {
+              if (key !== "x") return;
+              syncXZoomStateFromPlot(u);
+              if (hasYRangeLock()) applyYRangeToPlot();
+            },
+          ],
           setCursor: [
             (u) => {
               if (state.syncingCursor) return;
@@ -590,9 +1223,27 @@ elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_thr
         },
       };
 
+      refreshFullXExtents();
       state.plot = new uPlot(opts, data, chartHost);
+      if (hasXZoom()) applyXZoomToPlot();
+      if (yLocked) {
+        applyYRangeToPlot();
+        requestAnimationFrame(() => {
+          if (state.plot && hasYRangeLock()) applyYRangeToPlot();
+        });
+      }
       renderChartLegend(series);
       syncChartCursor();
+      updateXZoomUi();
+    }
+
+    function resizeChart() {
+      if (!state.plot) return;
+      const w = Math.max(chartWrap.clientWidth - 16, 320);
+      const h = Math.max(chartWrap.clientHeight - 8, 160);
+      state.plot.setSize({ width: w, height: h });
+      if (hasXZoom()) applyXZoomToPlot();
+      if (hasYRangeLock()) applyYRangeToPlot();
     }
 
     function syncChartCursor() {
@@ -618,6 +1269,14 @@ elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_thr
       dataTable.hidden = !on;
       detailPanel.hidden = !on || state.rows.length === 0;
       chartSection.hidden = !on;
+      wordGroupsEl.hidden = !on;
+      yMinOverride.disabled = !on;
+      yMaxOverride.disabled = !on;
+      yRangeFromData.disabled = !on;
+      yRangeApply.disabled = !on;
+      yRangeAuto.disabled = !on;
+      xZoomReset.disabled = !on || !hasXZoom();
+      if (!on) xZoomHint.textContent = "";
     }
 
     function visibleColumnIndices() {
@@ -626,6 +1285,71 @@ elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_thr
         if (state.visible[i]) out.push(i);
       }
       return out;
+    }
+
+    function columnTokens(name) {
+      return name.split("_").filter(Boolean);
+    }
+
+    function buildWordGroups() {
+      const map = new Map();
+      state.headers.forEach((name, i) => {
+        for (const tok of columnTokens(name)) {
+          if (!map.has(tok)) map.set(tok, []);
+          const arr = map.get(tok);
+          if (!arr.includes(i)) arr.push(i);
+        }
+      });
+      state.wordGroups = [...map.entries()].sort(
+        (a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0])
+      );
+    }
+
+    function syncColumnCheckboxes() {
+      columnList.querySelectorAll(".column-item").forEach((el) => {
+        const i = Number(el.dataset.index);
+        const cb = el.querySelector('input[type="checkbox"]');
+        if (cb) cb.checked = state.visible[i];
+      });
+    }
+
+    function setColumnsVisible(indices, on) {
+      for (const i of indices) state.visible[i] = on;
+      syncColumnCheckboxes();
+      renderAll();
+      scheduleStorageSave();
+    }
+
+    function buildWordGroupPanel() {
+      wordGroupsList.replaceChildren();
+      for (const [word, indices] of state.wordGroups) {
+        const row = document.createElement("div");
+        row.className = "word-group-row";
+        row.dataset.word = word;
+        row.dataset.indices = indices.join(",");
+        const label = document.createElement("span");
+        label.className = "word-group-label";
+        label.textContent = word;
+        const count = document.createElement("span");
+        count.className = "word-group-count";
+        count.textContent = `(${indices.length})`;
+        const actions = document.createElement("div");
+        actions.className = "word-group-actions";
+        const allBtn = document.createElement("button");
+        allBtn.type = "button";
+        allBtn.className = "mini-btn";
+        allBtn.textContent = "All";
+        allBtn.addEventListener("click", () => setColumnsVisible(indices, true));
+        const noneBtn = document.createElement("button");
+        noneBtn.type = "button";
+        noneBtn.className = "mini-btn";
+        noneBtn.textContent = "None";
+        noneBtn.addEventListener("click", () => setColumnsVisible(indices, false));
+        actions.append(allBtn, noneBtn);
+        row.append(label, count, actions);
+        wordGroupsList.appendChild(row);
+      }
+      applyColumnFilter();
     }
 
     function buildColumnList() {
@@ -641,6 +1365,7 @@ elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_thr
         cb.addEventListener("change", () => {
           state.visible[i] = cb.checked;
           renderAll();
+          scheduleStorageSave();
         });
         const span = document.createElement("span");
         span.textContent = name;
@@ -650,6 +1375,7 @@ elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_thr
           cb.checked = !cb.checked;
           state.visible[i] = cb.checked;
           renderAll();
+          scheduleStorageSave();
         });
         columnList.appendChild(item);
       });
@@ -657,12 +1383,21 @@ elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_thr
     }
 
     let filterDebounce = null;
+    function columnMatchesSearch(ci, q) {
+      if (!q.length) return true;
+      return (state.headers[ci] || "").toLowerCase().includes(q);
+    }
+
     function applyColumnFilter() {
       const q = state.searchQuery.toLowerCase();
       columnList.querySelectorAll(".column-item").forEach((el) => {
         const i = Number(el.dataset.index);
-        const name = state.headers[i] || "";
-        el.classList.toggle("hidden-filter", q.length > 0 && !name.toLowerCase().includes(q));
+        el.classList.toggle("hidden-filter", !columnMatchesSearch(i, q));
+      });
+      wordGroupsList.querySelectorAll(".word-group-row").forEach((el) => {
+        const indices = el.dataset.indices.split(",").map(Number).filter((n) => !Number.isNaN(n));
+        const anyMatch = q.length === 0 || indices.some((i) => columnMatchesSearch(i, q));
+        el.classList.toggle("hidden-filter", !anyMatch);
       });
     }
 
@@ -734,6 +1469,7 @@ elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_thr
       if (!opts.fromChart) syncChartCursor();
       const row = tableBody.querySelector(`tr[data-row-index="${index}"]`);
       if (row) row.scrollIntoView({ block: "nearest" });
+      scheduleStorageSave();
     }
 
     function updateRowControls() {
@@ -750,12 +1486,30 @@ elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_thr
       nextRow.disabled = i >= n - 1;
     }
 
+    function loadCsvFromFile(file) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const path = csvPathInput.value.trim() || file.name;
+        loadCsvText(reader.result, path);
+      };
+      reader.readAsText(file);
+    }
+
     fileInput.addEventListener("change", () => {
       const file = fileInput.files?.[0];
-      if (!file) return;
-      const reader = new FileReader();
-      reader.onload = () => loadCsvText(reader.result, file.name);
-      reader.readAsText(file);
+      if (!file) {
+        updateFileLabel();
+        return;
+      }
+      loadCsvFromFile(file);
+    });
+
+    csvPathLoad.addEventListener("click", () => {
+      loadCsvFromPath(csvPathInput.value, null);
+    });
+
+    csvPathInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") csvPathLoad.click();
     });
 
     document.body.addEventListener("dragover", (e) => {
@@ -770,27 +1524,53 @@ elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_thr
       dropHint.classList.remove("drag-over");
       const file = e.dataTransfer?.files?.[0];
       if (!file) return;
-      const reader = new FileReader();
-      reader.onload = () => loadCsvText(reader.result, file.name);
-      reader.readAsText(file);
+      loadCsvFromFile(file);
     });
 
     logScaleEl.addEventListener("change", () => {
       state.logScale = logScaleEl.checked;
+      if (state.logScale && state.yMin != null && state.yMin <= 0) {
+        state.yMin = null;
+        state.yMax = null;
+        yRangeHint.textContent = "Y override cleared (log needs min > 0).";
+      }
       renderChart();
+      scheduleStorageSave();
+    });
+
+    yRangeFromData.addEventListener("click", () => {
+      const ext = plottedValueExtents();
+      if (!ext) {
+        yRangeHint.textContent = "No numeric series selected.";
+        return;
+      }
+      yMinOverride.value = String(ext.min);
+      yMaxOverride.value = String(ext.max);
+      yRangeHint.textContent = "Adjust limits, then Apply.";
+    });
+
+    yRangeApply.addEventListener("click", () => applyYRangeFromInputs());
+
+    yRangeAuto.addEventListener("click", () => clearYRangeOverride());
+
+    xZoomReset.addEventListener("click", () => resetXZoom());
+
+    [yMinOverride, yMaxOverride].forEach((el) => {
+      el.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") applyYRangeFromInputs();
+      });
     });
 
     showAllRowsEl.addEventListener("change", () => {
       state.showAllRows = showAllRowsEl.checked;
       renderTable();
+      scheduleStorageSave();
     });
 
     let resizeDebounce = null;
     const resizeObserver = new ResizeObserver(() => {
       clearTimeout(resizeDebounce);
-      resizeDebounce = setTimeout(() => {
-        if (state.plot) renderChart();
-      }, 80);
+      resizeDebounce = setTimeout(resizeChart, 80);
     });
     resizeObserver.observe(chartWrap);
 
@@ -803,18 +1583,17 @@ elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_thr
     columnSearch.addEventListener("input", () => {
       state.searchQuery = columnSearch.value;
       clearTimeout(filterDebounce);
-      filterDebounce = setTimeout(applyColumnFilter, 100);
+      filterDebounce = setTimeout(() => {
+        applyColumnFilter();
+        scheduleStorageSave();
+      }, 100);
     });
 
     selectAllBtn.addEventListener("click", () => {
-      state.visible = state.headers.map(() => true);
-      columnList.querySelectorAll('input[type="checkbox"]').forEach((cb) => { cb.checked = true; });
-      renderAll();
+      setColumnsVisible(state.headers.map((_, i) => i), true);
     });
     selectNoneBtn.addEventListener("click", () => {
-      state.visible = state.headers.map(() => false);
-      columnList.querySelectorAll('input[type="checkbox"]').forEach((cb) => { cb.checked = false; });
-      renderAll();
+      setColumnsVisible(state.headers.map((_, i) => i), false);
     });
 
     tableWrap.addEventListener("keydown", (e) => {
@@ -828,25 +1607,17 @@ elapsed_ms,shutdown_requested,abort_requested,pending_scale_operation,parked_thr
       }
     });
 
-    function loadEmbeddedCsv() {
-      const el = document.getElementById("embeddedCsv");
-      if (!el || !el.textContent.trim()) return;
-      loadCsvText(el.textContent, "piper_1779306281518.csv");
+    function initFromStorage() {
+      const saved = loadSavedState();
+      if (!saved?.csvText) return;
+      if (saved.csvPath) {
+        state.csvPath = saved.csvPath;
+        csvPathInput.value = saved.csvPath;
+      }
+      loadCsvText(saved.csvText, saved.csvPath || "saved.csv", saved.config || null);
     }
 
-    const params = new URLSearchParams(location.search);
-    const csvParam = params.get("csv");
-    if (csvParam) {
-      fetch(csvParam)
-        .then((r) => {
-          if (!r.ok) throw new Error(r.statusText);
-          return r.text();
-        })
-        .then((text) => loadCsvText(text, csvParam))
-        .catch(loadEmbeddedCsv);
-    } else {
-      loadEmbeddedCsv();
-    }
+    initFromStorage();
   </script>
 </body>
 </html>
