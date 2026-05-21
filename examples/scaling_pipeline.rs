@@ -1,7 +1,7 @@
 use piper::{
-    BufferLease, CsvTelemetryConfig, PiperConfig, PiperSnapshot, QueueTrend, Stage, StageContext,
-    StageExt, anchor, pipeline,
+    BufferLease, CsvTelemetryConfig, PiperConfig, Stage, StageContext, StageExt, anchor, pipeline,
 };
+use std::io::{self, Write};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -188,7 +188,6 @@ fn main() -> piper::Result<(), ExampleError> {
     let piper = ScalingPipeline::start()?;
     let sender = piper.sender();
     let receiver = piper.receiver();
-    let started = Instant::now();
 
     let producer = thread::spawn(move || {
         for batch_index in 0..BATCH_COUNT {
@@ -201,7 +200,6 @@ fn main() -> piper::Result<(), ExampleError> {
     });
 
     let mut received_batches = 0usize;
-    let mut received_items = 0usize;
     let mut producer = Some(producer);
     let mut producer_joined = false;
     let mut next_telemetry = Instant::now();
@@ -219,7 +217,6 @@ fn main() -> piper::Result<(), ExampleError> {
         match receiver.recv_timeout(Duration::from_millis(25)) {
             Ok(batch) => {
                 received_batches += 1;
-                received_items += batch.len();
                 drop(batch);
             }
             Err(piper::RecvOutputError::Timeout) => {}
@@ -230,10 +227,13 @@ fn main() -> piper::Result<(), ExampleError> {
         }
 
         if next_telemetry.elapsed() >= TELEMETRY_INTERVAL {
-            print_telemetry(started.elapsed(), &piper.get_telemetry(), received_batches);
+            print_progress(received_batches);
             next_telemetry = Instant::now();
         }
     }
+
+    print_progress(received_batches);
+    println!();
 
     if let Some(producer) = producer {
         producer.join().expect("producer thread should not panic");
@@ -241,98 +241,11 @@ fn main() -> piper::Result<(), ExampleError> {
 
     piper.shutdown();
     piper.join()?;
-    let elapsed = started.elapsed();
-    println!("completed {received_batches} batches / {received_items} items in {elapsed:?}");
     Ok(())
 }
 
-fn print_telemetry(elapsed: Duration, telemetry: &PiperSnapshot, received_batches: usize) {
-    println!(
-        "\n[{:>5.2}s] rx={received_batches}/{BATCH_COUNT} | workers={}/{} | parked={} | pending={} | budget_pressure={} | out_pressure={} | anchor={} {}/{} {:?} {:?}",
-        elapsed.as_secs_f64(),
-        telemetry.total_active_workers,
-        telemetry.global_worker_cap,
-        telemetry.parked_threads,
-        telemetry.pending_scale_operation,
-        telemetry.budget_pressure,
-        telemetry.output_backpressure,
-        telemetry.anchor.stage_name,
-        telemetry.anchor.active_threads,
-        telemetry.anchor.max_threads,
-        telemetry.anchor.probe_state,
-        telemetry.anchor.last_probe_reason,
-    );
-    println!(
-        "  {:<11} {:>3} {:>3}  {:<43} {:<43} {:>5} {:>10}  scale",
-        "stage", "w", "want", "input", "output", "busy", "job/ms"
-    );
-
-    for index in 0..telemetry.stages.len() {
-        println!("  {}", stage_summary(index, telemetry));
-    }
-}
-
-fn stage_summary(index: usize, telemetry: &PiperSnapshot) -> String {
-    let stage = &telemetry.stages[index];
-    let marker = if stage.is_anchor { "*" } else { "" };
-    let busy = (stage.busy_ratio * 100.0).clamp(0.0, 100.0);
-    let name = format!("{}{}", stage.name, marker);
-
-    format!(
-        "{:<11} {:>3} {:>3}  {:<43} {:<43} {:>4.0}% {:>10.3}  {:?}",
-        name,
-        stage.active_threads,
-        stage.desired_workers,
-        queue_status(index, telemetry),
-        queue_status(index + 1, telemetry),
-        busy,
-        stage.per_worker_throughput / 1000.0,
-        stage.scaling_state,
-    )
-}
-
-fn queue_status(index: usize, telemetry: &PiperSnapshot) -> String {
-    let link = &telemetry.links[index];
-    format!(
-        "{} len={} trend={}({}) net={:+.1}/s",
-        queue_label(index, telemetry),
-        link.len,
-        trend_label_for_queue(index, link.trend, telemetry),
-        link.trend.code(),
-        link.net_rate,
-    )
-}
-
-fn queue_label(index: usize, telemetry: &PiperSnapshot) -> String {
-    if index == 0 {
-        "IN".to_string()
-    } else if index + 1 == telemetry.links.len() {
-        "OUT".to_string()
-    } else {
-        format!(
-            "{}->{}",
-            telemetry.stages[index - 1].name,
-            telemetry.stages[index].name
-        )
-    }
-}
-
-fn trend_label_for_queue(
-    index: usize,
-    trend: QueueTrend,
-    telemetry: &PiperSnapshot,
-) -> &'static str {
-    if index + 1 == telemetry.links.len() && trend == QueueTrend::Starved {
-        return "empty";
-    }
-
-    match trend {
-        QueueTrend::Starved => "starved",
-        QueueTrend::FastDraining => "fast-drain",
-        QueueTrend::Draining => "drain",
-        QueueTrend::Stable => "stable",
-        QueueTrend::Growing => "grow",
-        QueueTrend::FastGrowing => "fast-grow",
-        QueueTrend::Runaway => "runaway",
-    }
+fn print_progress(received_batches: usize) {
+    let progress = (received_batches as f64 / BATCH_COUNT as f64) * 100.0;
+    print!("\r{:>6.2}%", progress);
+    io::stdout().flush().expect("flush progress output");
 }

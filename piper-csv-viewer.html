@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Piper CSV Viewer</title>
-  <!-- Session (path, CSV data, columns, zoom, etc.) is saved in localStorage and restored on reload. -->
+  <!-- Session (path, columns, zoom, etc.) is saved in localStorage and restored on reload via path re-fetch. -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
   <style>
     *, *::before, *::after { box-sizing: border-box; }
@@ -269,12 +269,13 @@
       min-height: 0;
       position: relative;
       padding: 0 8px 4px;
+      overflow: visible;
     }
     .chart-wrap .uplot {
       font-family: inherit;
     }
     .chart-wrap .u-legend { display: none; }
-    #chartHost { width: 100%; height: 100%; }
+    #chartHost { width: 100%; height: 100%; overflow: visible; }
     .chart-legend {
       display: flex;
       flex-wrap: wrap;
@@ -284,12 +285,28 @@
       max-height: 56px;
       overflow-y: auto;
     }
+    .chart-series-hint {
+      color: #7eb8ff;
+      font-size: 11px;
+      max-width: 360px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex-shrink: 1;
+      min-width: 0;
+    }
     .legend-item {
       display: flex;
       align-items: center;
       gap: 6px;
       font-size: 11px;
       color: #8b93a1;
+      cursor: pointer;
+    }
+    .legend-item:hover { color: #b8c0cc; }
+    .legend-item.picked {
+      color: #d8dce3;
+      font-weight: 600;
     }
     .legend-swatch {
       width: 10px;
@@ -393,7 +410,7 @@
     </label>
     <input type="text" class="csv-path" id="csvPathInput" placeholder="C:\full\path\to\file.csv">
     <button type="button" id="csvPathLoad">Load path</button>
-    <span class="drop-hint" id="dropHint">Session auto-saves to browser storage on reload</span>
+    <span class="drop-hint" id="dropHint">Session saves path and settings — reload restores via path field</span>
     <label><input type="checkbox" id="logScale"> Log Y</label>
     <label><input type="checkbox" id="showAllRows" checked> Show all rows</label>
     <button type="button" id="prevRow" disabled>&larr;</button>
@@ -423,6 +440,7 @@
           <span>Graph — drag to zoom X (elapsed_ms)</span>
           <button type="button" id="xZoomReset" disabled>Reset X zoom</button>
           <span class="chart-hint" id="xZoomHint"></span>
+          <span class="chart-series-hint" id="chartSeriesHint">Click a line to identify</span>
           <div class="y-range">
             <span>Y min</span>
             <input type="text" id="yMinOverride" inputmode="decimal" placeholder="auto" disabled>
@@ -480,12 +498,19 @@
       plot: null,
       syncingCursor: false,
       csvPath: null,
+      chartSeriesCols: [],
+      pickedPlotSeries: null,
+      xValues: null,
+      seriesCache: null,
+      numericColumns: null,
+      chartLogScale: false,
+      chartYLocked: false,
     };
 
     let storageApplyDepth = 0;
     let storageSaveTimer = null;
-    let lastLoadedCsvText = null;
     const STORAGE_KEY = "piperViewerSave";
+    const CSV_CACHE_KEY = "piperViewerCsvCache";
 
     function pathKey(path) {
       return (path || "").trim().replace(/\\/g, "/").toLowerCase();
@@ -520,15 +545,34 @@
       }
     }
 
+    function loadCsvCache(path) {
+      try {
+        const raw = localStorage.getItem(CSV_CACHE_KEY);
+        if (!raw) return null;
+        const cached = JSON.parse(raw);
+        if (cached?.csvText && pathKey(cached.path) === pathKey(path)) return cached.csvText;
+      } catch (_) {}
+      return null;
+    }
+
+    function persistCsvCache(text, path) {
+      if (!text || !path) return;
+      try {
+        localStorage.setItem(
+          CSV_CACHE_KEY,
+          JSON.stringify({ path: pathKey(path), csvText: text })
+        );
+      } catch (_) {}
+    }
+
     function persistToStorage() {
-      if (storageApplyDepth > 0 || !lastLoadedCsvText) return;
+      if (storageApplyDepth > 0 || state.headers.length === 0) return;
       const path = (state.csvPath || csvPathInput.value || "").trim() || null;
       try {
         localStorage.setItem(
           STORAGE_KEY,
           JSON.stringify({
             csvPath: path,
-            csvText: lastLoadedCsvText,
             config: buildConfigFromState(),
           })
         );
@@ -581,6 +625,7 @@
     const yRangeHint = document.getElementById("yRangeHint");
     const xZoomReset = document.getElementById("xZoomReset");
     const xZoomHint = document.getElementById("xZoomHint");
+    const chartSeriesHint = document.getElementById("chartSeriesHint");
     const rowSlider = document.getElementById("rowSlider");
     const prevRow = document.getElementById("prevRow");
     const nextRow = document.getElementById("nextRow");
@@ -666,9 +711,63 @@
     }
 
     function defaultVisible() {
-      const picked = state.headers.map((_, i) => isNumericColumn(i));
+      const picked = state.numericColumns.slice();
       if (picked.some(Boolean)) return picked;
       return state.headers.map(() => true);
+    }
+
+    function buildDataCaches() {
+      const n = state.rows.length;
+      const xi = xAxisIndex();
+      state.xValues = new Array(n);
+      if (xi >= 0) {
+        for (let i = 0; i < n; i++) state.xValues[i] = Number(state.rows[i][xi]);
+      } else {
+        for (let i = 0; i < n; i++) state.xValues[i] = i;
+      }
+      state.seriesCache = new Map();
+      for (let ci = 0; ci < state.headers.length; ci++) {
+        if (!state.numericColumns[ci]) continue;
+        const arr = new Array(n);
+        for (let i = 0; i < n; i++) {
+          const num = Number(state.rows[i][ci]);
+          arr[i] = Number.isFinite(num) ? num : null;
+        }
+        state.seriesCache.set(ci, arr);
+      }
+    }
+
+    function seriesColsEqual(a, b) {
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+      return true;
+    }
+
+    function buildChartData(series) {
+      const data = [state.xValues];
+      for (const ci of series) data.push(state.seriesCache.get(ci));
+      return data;
+    }
+
+    function rowIndexRangeForXRange(xMin, xMax) {
+      const x = state.xValues;
+      if (!x || x.length === 0) return { start: 0, end: 0 };
+      let lo = 0;
+      let hi = x.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (x[mid] < xMin) lo = mid + 1;
+        else hi = mid;
+      }
+      const start = lo;
+      lo = start;
+      hi = x.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (x[mid] <= xMax) lo = mid + 1;
+        else hi = mid;
+      }
+      return { start, end: lo };
     }
 
     function applySavedConfigUiOnly(cfg) {
@@ -809,6 +908,12 @@
           targets.push(u);
         }
       };
+      const base = pathParam.replace(/^.*[/\\]/, "");
+      if (base) {
+        try {
+          add(new URL(base, location.href).href);
+        } catch (_) {}
+      }
       add(resolveCsvFetchUrl(pathParam));
       if (!isFullFilesystemPath(pathParam) && !pathParam.includes("/") && !pathParam.includes("\\")) {
         try {
@@ -823,21 +928,29 @@
       return " From file://, Chromium may need --allow-file-access-from-files, or place the CSV next to this HTML file.";
     }
 
-    function loadCsvFromPath(pathParam, savedConfig) {
+    function loadCsvFromPath(pathParam, savedConfig, opts = {}) {
       const path = pathParam.trim();
       if (!path) return;
       state.csvPath = path;
       csvPathInput.value = path;
-      const saved = loadSavedState();
-      if (saved?.csvText && saved.csvPath && pathKey(saved.csvPath) === pathKey(path)) {
-        const cfg = savedConfig !== undefined ? savedConfig : saved.config;
-        loadCsvText(saved.csvText, path, cfg);
-        return;
-      }
       const targets = csvFetchTargets(path);
+      const tryFallback = () => {
+        const cached =
+          opts.fallbackText ||
+          loadCsvCache(path) ||
+          (opts.legacySaved?.csvText &&
+          pathKey(opts.legacySaved.csvPath || path) === pathKey(path)
+            ? opts.legacySaved.csvText
+            : null);
+        if (cached) {
+          loadCsvText(cached, path, savedConfig);
+          return;
+        }
+        statusEl.textContent = `Could not load: ${path}.${localFileAccessHint()}`;
+      };
       const tryNext = (i) => {
         if (i >= targets.length) {
-          statusEl.textContent = `Could not load: ${path}.${localFileAccessHint()}`;
+          tryFallback();
           return;
         }
         fetch(targets[i])
@@ -848,17 +961,22 @@
           .then((text) => loadCsvText(text, path, savedConfig))
           .catch(() => tryNext(i + 1));
       };
+      if (targets.length === 0) {
+        tryFallback();
+        return;
+      }
       tryNext(0);
     }
 
     function loadCsvText(text, name, savedConfig) {
-      lastLoadedCsvText = text;
       const { headers, rows } = parseCsv(text);
       state.headers = headers;
       state.rows = rows;
       const pathLabel = (name || "").trim() || state.csvPath || "saved.csv";
       state.csvPath = pathLabel;
       csvPathInput.value = pathLabel;
+      state.numericColumns = state.headers.map((_, i) => isNumericColumn(i));
+      buildDataCaches();
       state.visible = defaultVisible();
       state.selectedRowIndex = rows.length > 0 ? 0 : -1;
       state.yMin = null;
@@ -870,7 +988,11 @@
       yRangeHint.textContent = "";
       refreshFullXExtents();
       updateXZoomUi();
-      statusEl.textContent = `${pathLabel}: ${rows.length} rows, ${headers.length} columns`;
+      let status = `${pathLabel}: ${rows.length} rows, ${headers.length} columns`;
+      if (!isFullFilesystemPath(pathLabel)) {
+        status += " — Enter a full path to auto-reload after page refresh.";
+      }
+      statusEl.textContent = status;
       enableControls(true);
       buildWordGroups();
       buildWordGroupPanel();
@@ -878,6 +1000,7 @@
       if (savedConfig) applySavedConfig(savedConfig);
       else renderAll();
       updateFileLabel();
+      persistCsvCache(text, pathLabel);
       persistToStorage();
     }
 
@@ -889,6 +1012,7 @@
     }
 
     function destroyChart() {
+      state.pickedPlotSeries = null;
       if (state.plot) {
         state.plot.destroy();
         state.plot = null;
@@ -902,6 +1026,7 @@
     }
 
     function getXValues() {
+      if (state.xValues) return state.xValues;
       const xi = xAxisIndex();
       if (xi >= 0) {
         return state.rows.map((r) => Number(r[xi]));
@@ -916,8 +1041,14 @@
         state.xFullMax = null;
         return;
       }
-      state.xFullMin = Math.min(...x);
-      state.xFullMax = Math.max(...x);
+      let min = Infinity;
+      let max = -Infinity;
+      for (let i = 0; i < x.length; i++) {
+        if (x[i] < min) min = x[i];
+        if (x[i] > max) max = x[i];
+      }
+      state.xFullMin = min;
+      state.xFullMax = max;
     }
 
     function hasXZoom() {
@@ -949,7 +1080,12 @@
       if (state.plot && state.xFullMin != null && state.xFullMax != null) {
         state.plot.setScale("x", { min: state.xFullMin, max: state.xFullMax });
         state.plot.setSelect({ left: 0, width: 0, top: 0, height: 0 }, false);
-        applyYRangeToPlot();
+        if (hasYRangeLock()) applyYRangeToPlot();
+        else {
+          const ext = plottedValueExtents();
+          if (ext) state.plot.setScale("y", { min: ext.min, max: ext.max });
+        }
+        syncPlotLayout();
       }
       updateXZoomUi();
       scheduleStorageSave();
@@ -975,19 +1111,36 @@
 
     function chartSeriesIndices() {
       const xi = xAxisIndex();
-      return visibleColumnIndices().filter((ci) => ci !== xi && isNumericColumn(ci));
+      return visibleColumnIndices().filter((ci) => ci !== xi && state.numericColumns[ci]);
     }
 
     function plottedValueExtents() {
       const series = chartSeriesIndices();
+      let start = 0;
+      let end = state.rows.length;
+      if (!hasYRangeLock() && hasXZoom()) {
+        const range = rowIndexRangeForXRange(state.xZoomMin, state.xZoomMax);
+        start = range.start;
+        end = range.end;
+      }
       let min = Infinity;
       let max = -Infinity;
       for (const ci of series) {
-        for (const row of state.rows) {
-          const n = Number(row[ci]);
-          if (!Number.isFinite(n)) continue;
-          if (n < min) min = n;
-          if (n > max) max = n;
+        const cached = state.seriesCache?.get(ci);
+        if (cached) {
+          for (let i = start; i < end; i++) {
+            const n = cached[i];
+            if (n == null || !Number.isFinite(n)) continue;
+            if (n < min) min = n;
+            if (n > max) max = n;
+          }
+        } else {
+          for (let i = start; i < end; i++) {
+            const n = Number(state.rows[i][ci]);
+            if (!Number.isFinite(n)) continue;
+            if (n < min) min = n;
+            if (n > max) max = n;
+          }
         }
       }
       if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
@@ -1050,6 +1203,42 @@
       return y;
     }
 
+    function formatYAxisLabel(v) {
+      if (v == null || !Number.isFinite(v)) return "";
+      const abs = Math.abs(v);
+      if (abs === 0) return "0";
+      if (state.logScale) return v.toPrecision(3);
+      if (abs >= 1e9) return (v / 1e9).toFixed(1) + "G";
+      if (abs >= 1e6) return (v / 1e6).toFixed(1) + "M";
+      if (abs >= 1e4) return (v / 1e3).toFixed(1) + "k";
+      if (abs >= 100) return v.toFixed(0);
+      if (abs >= 10) return v.toFixed(1);
+      if (abs >= 1) return v.toFixed(2);
+      return v.toPrecision(3);
+    }
+
+    function chartDimensions() {
+      return {
+        w: Math.max(chartHost.clientWidth || chartWrap.clientWidth, 320),
+        h: Math.max(chartHost.clientHeight || chartWrap.clientHeight, 160),
+      };
+    }
+
+    function syncPlotLayout() {
+      if (!state.plot) return;
+      const { w, h } = chartDimensions();
+      state.plot.setSize({ width: w, height: h });
+    }
+
+    function buildYAxisOpts() {
+      return {
+        stroke: "#8b93a1",
+        grid: { stroke: "#2a2f38" },
+        values: (_u, vals) => vals.map(formatYAxisLabel),
+        gap: 8,
+      };
+    }
+
     function applyYRangeToPlot() {
       if (!state.plot || !hasYRangeLock()) return;
       const r = effectiveYRange();
@@ -1058,6 +1247,7 @@
       y.auto = yAutoFn;
       y.range = yRangeFn;
       state.plot.setScale("y", { min: r[0], max: r[1] });
+      syncPlotLayout();
     }
 
     function formatYRangeHint() {
@@ -1111,47 +1301,159 @@
       scheduleStorageSave();
     }
 
+    function updateChartSeriesHint(plotSi, hover) {
+      if (!state.plot) return;
+      if (plotSi != null && plotSi > 0) {
+        const name = state.plot.series[plotSi].label || state.headers[state.chartSeriesCols[plotSi - 1]];
+        chartSeriesHint.textContent = hover ? `Nearest: ${name}` : `Series: ${name}`;
+        return;
+      }
+      if (!state.pickedPlotSeries) {
+        chartSeriesHint.textContent = "Click a line to identify";
+      }
+    }
+
+    function updateLegendPick(plotSi) {
+      chartLegend.querySelectorAll(".legend-item").forEach((el) => {
+        const si = Number(el.dataset.si);
+        el.classList.toggle("picked", plotSi != null && si + 1 === plotSi);
+      });
+    }
+
+    function applySeriesPick(u, plotSi) {
+      state.pickedPlotSeries = plotSi;
+      for (let i = 1; i < u.series.length; i++) {
+        const on = i === plotSi;
+        u.setSeries(i, { width: on ? 3 : 1 }, false);
+      }
+      updateChartSeriesHint(plotSi, false);
+      updateLegendPick(plotSi);
+    }
+
+    function clearSeriesPick() {
+      state.pickedPlotSeries = null;
+      const u = state.plot;
+      if (u) {
+        for (let i = 1; i < u.series.length; i++) {
+          u.setSeries(i, { width: 2 }, false);
+        }
+      }
+      chartSeriesHint.textContent = "Click a line to identify";
+      updateLegendPick(null);
+    }
+
+    function pickNearestSeries(u, left, top) {
+      u.setCursor({ left, top }, true);
+      const idx = u.cursor.idx;
+      if (idx == null || idx < 0) return;
+      let bestPlotSi = null;
+      let bestDist = Infinity;
+      for (let si = 1; si < u.series.length; si++) {
+        const val = u.data[si][idx];
+        if (val == null || !Number.isFinite(val)) continue;
+        const yPx = u.valToPos(val, "y", true);
+        const dist = Math.abs(yPx - top);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestPlotSi = si;
+        }
+      }
+      if (bestPlotSi == null || bestDist > 28) {
+        clearSeriesPick();
+        return;
+      }
+      if (state.pickedPlotSeries === bestPlotSi) {
+        clearSeriesPick();
+        return;
+      }
+      applySeriesPick(u, bestPlotSi);
+    }
+
+    function bindChartSeriesPick(u) {
+      if (u.over.dataset.seriesPickBound) return;
+      u.over.dataset.seriesPickBound = "1";
+      u.over.addEventListener("mouseup", () => {
+        if (state.plot !== u) return;
+        if (u.select.width >= 8) return;
+        pickNearestSeries(u, u.cursor.left, u.cursor.top);
+      });
+    }
+
     function renderChartLegend(series) {
       chartLegend.replaceChildren();
       series.forEach((ci, si) => {
         const item = document.createElement("span");
         item.className = "legend-item";
+        if (state.pickedPlotSeries === si + 1) item.classList.add("picked");
+        item.dataset.si = String(si);
         const sw = document.createElement("span");
         sw.className = "legend-swatch";
         sw.style.background = CHART_COLORS[si % CHART_COLORS.length];
         const label = document.createElement("span");
         label.textContent = state.headers[ci];
         item.append(sw, label);
+        item.addEventListener("click", () => {
+          if (!state.plot) return;
+          const plotSi = si + 1;
+          if (state.pickedPlotSeries === plotSi) clearSeriesPick();
+          else applySeriesPick(state.plot, plotSi);
+        });
         chartLegend.appendChild(item);
       });
     }
 
     function renderChart() {
-      destroyChart();
       if (state.rows.length === 0) {
+        destroyChart();
         chartEmpty.hidden = false;
         chartEmpty.textContent = "Load CSV and select numeric columns to graph.";
         return;
       }
       const series = chartSeriesIndices();
       const hasSeries = series.length > 0;
-      chartEmpty.hidden = hasSeries;
-      chartEmpty.textContent = hasSeries
-        ? ""
-        : "Select numeric columns in the sidebar to plot (e.g. busy_ratio, link lengths).";
-      if (!hasSeries) return;
+      if (!hasSeries) {
+        destroyChart();
+        chartEmpty.hidden = false;
+        chartEmpty.textContent =
+          "Select numeric columns in the sidebar to plot (e.g. busy_ratio, link lengths).";
+        return;
+      }
 
-      const x = getXValues();
-      const data = [x];
-      const seriesOpts = [{}];
+      chartEmpty.hidden = true;
+      const data = buildChartData(series);
       const yLocked = hasYRangeLock();
+      const canReuse =
+        state.plot &&
+        seriesColsEqual(series, state.chartSeriesCols) &&
+        state.chartLogScale === state.logScale &&
+        state.chartYLocked === yLocked;
+
+      if (canReuse) {
+        state.plot.setData(data);
+        if (hasXZoom()) applyXZoomToPlot();
+        else if (state.xFullMin != null && state.xFullMax != null) {
+          state.plot.setScale("x", { min: state.xFullMin, max: state.xFullMax });
+        }
+        if (hasYRangeLock()) applyYRangeToPlot();
+        else {
+          const ext = plottedValueExtents();
+          if (ext) state.plot.setScale("y", { min: ext.min, max: ext.max });
+        }
+        syncPlotLayout();
+        syncChartCursor();
+        updateXZoomUi();
+        return;
+      }
+
+      destroyChart();
+      state.chartSeriesCols = series.slice();
+      state.chartLogScale = state.logScale;
+      state.chartYLocked = yLocked;
+      state.pickedPlotSeries = null;
+      chartSeriesHint.textContent = "Click a line to identify";
+
+      const seriesOpts = [{}];
       series.forEach((ci, si) => {
-        data.push(
-          state.rows.map((r) => {
-            const n = Number(r[ci]);
-            return Number.isFinite(n) ? n : null;
-          })
-        );
         seriesOpts.push({
           label: state.headers[ci],
           stroke: CHART_COLORS[si % CHART_COLORS.length],
@@ -1160,8 +1462,7 @@
         });
       });
 
-      const w = Math.max(chartWrap.clientWidth - 16, 320);
-      const h = Math.max(chartWrap.clientHeight - 8, 160);
+      const { w, h } = chartDimensions();
       const scales = {
         x: { time: false },
         y: buildYScaleOpts(),
@@ -1178,10 +1479,7 @@
             values: (_u, vals) =>
               vals.map((v) => (v >= 1000 ? `${(v / 1000).toFixed(1)}s` : `${v}ms`)),
           },
-          {
-            stroke: "#8b93a1",
-            grid: { stroke: "#2a2f38" },
-          },
+          buildYAxisOpts(),
         ],
         select: {
           show: true,
@@ -1191,11 +1489,13 @@
         },
         cursor: {
           drag: { x: true, y: false, setScale: true },
+          focus: { prox: 24 },
           points: { size: 5, stroke: "#d8dce3", fill: "#14161a" },
         },
         hooks: {
           ready: [
             (u) => {
+              bindChartSeriesPick(u);
               if (hasXZoom()) applyXZoomToPlot();
               else if (state.xFullMin != null && state.xFullMax != null) {
                 u.setScale("x", { min: state.xFullMin, max: state.xFullMax });
@@ -1204,20 +1504,41 @@
               syncXZoomStateFromPlot(u);
             },
           ],
+          setSeries: [
+            (u, plotSi, opts) => {
+              if (opts.focus == null || state.pickedPlotSeries != null) return;
+              if (plotSi > 0) updateChartSeriesHint(plotSi, true);
+              else if (!state.pickedPlotSeries) chartSeriesHint.textContent = "Click a line to identify";
+            },
+          ],
           setScale: [
             (u, key) => {
               if (key !== "x") return;
               syncXZoomStateFromPlot(u);
               if (hasYRangeLock()) applyYRangeToPlot();
+              else {
+                const ext = plottedValueExtents();
+                if (ext) u.setScale("y", { min: ext.min, max: ext.max });
+                syncPlotLayout();
+              }
             },
           ],
           setCursor: [
             (u) => {
               if (state.syncingCursor) return;
               const idx = u.cursor.idx;
-              if (idx != null && idx >= 0 && idx !== state.selectedRowIndex) {
-                selectRow(idx, { fromChart: true });
+              if (idx == null || idx < 0 || idx === state.selectedRowIndex) return;
+              const prev = state.selectedRowIndex;
+              state.selectedRowIndex = idx;
+              rowSlider.value = String(idx);
+              updateRowControls();
+              if (state.showAllRows && tableBody.childElementCount > 0) {
+                updateTableSelection(prev, idx);
+              } else {
+                renderTable();
               }
+              renderDetail();
+              scheduleStorageSave();
             },
           ],
         },
@@ -1225,6 +1546,9 @@
 
       refreshFullXExtents();
       state.plot = new uPlot(opts, data, chartHost);
+      requestAnimationFrame(() => {
+        if (state.plot) syncPlotLayout();
+      });
       if (hasXZoom()) applyXZoomToPlot();
       if (yLocked) {
         applyYRangeToPlot();
@@ -1239,9 +1563,7 @@
 
     function resizeChart() {
       if (!state.plot) return;
-      const w = Math.max(chartWrap.clientWidth - 16, 320);
-      const h = Math.max(chartWrap.clientHeight - 8, 160);
-      state.plot.setSize({ width: w, height: h });
+      syncPlotLayout();
       if (hasXZoom()) applyXZoomToPlot();
       if (hasYRangeLock()) applyYRangeToPlot();
     }
@@ -1361,7 +1683,7 @@
         const cb = document.createElement("input");
         cb.type = "checkbox";
         cb.checked = state.visible[i];
-        if (!isNumericColumn(i)) item.style.opacity = "0.55";
+        if (!state.numericColumns[i]) item.style.opacity = "0.55";
         cb.addEventListener("change", () => {
           state.visible[i] = cb.checked;
           renderAll();
@@ -1441,6 +1763,17 @@
       }
     }
 
+    function updateTableSelection(prevIdx, nextIdx) {
+      if (prevIdx >= 0) {
+        const prev = tableBody.querySelector(`tr[data-row-index="${prevIdx}"]`);
+        if (prev) prev.classList.remove("selected");
+      }
+      if (nextIdx >= 0) {
+        const next = tableBody.querySelector(`tr[data-row-index="${nextIdx}"]`);
+        if (next) next.classList.add("selected");
+      }
+    }
+
     function renderDetail() {
       detailGrid.replaceChildren();
       if (state.selectedRowIndex < 0 || state.rows.length === 0) return;
@@ -1461,10 +1794,15 @@
 
     function selectRow(index, opts = {}) {
       if (index < 0 || index >= state.rows.length) return;
+      const prevIdx = state.selectedRowIndex;
       state.selectedRowIndex = index;
       rowSlider.value = String(index);
       updateRowControls();
-      renderTable();
+      if (opts.forceTableRebuild || tableBody.childElementCount === 0 || !state.showAllRows) {
+        renderTable();
+      } else {
+        updateTableSelection(prevIdx, index);
+      }
       renderDetail();
       if (!opts.fromChart) syncChartCursor();
       const row = tableBody.querySelector(`tr[data-row-index="${index}"]`);
@@ -1596,6 +1934,10 @@
       setColumnsVisible(state.headers.map((_, i) => i), false);
     });
 
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && state.pickedPlotSeries) clearSeriesPick();
+    });
+
     tableWrap.addEventListener("keydown", (e) => {
       if (state.rows.length === 0) return;
       if (e.key === "ArrowDown") {
@@ -1609,12 +1951,16 @@
 
     function initFromStorage() {
       const saved = loadSavedState();
-      if (!saved?.csvText) return;
+      if (!saved) return;
       if (saved.csvPath) {
         state.csvPath = saved.csvPath;
         csvPathInput.value = saved.csvPath;
+        loadCsvFromPath(saved.csvPath, saved.config || null, { legacySaved: saved });
+        return;
       }
-      loadCsvText(saved.csvText, saved.csvPath || "saved.csv", saved.config || null);
+      if (saved.csvText) {
+        loadCsvText(saved.csvText, saved.csvPath || "saved.csv", saved.config || null);
+      }
     }
 
     initFromStorage();
