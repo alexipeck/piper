@@ -2632,7 +2632,7 @@ fn choose_anchor_probe_operation(
     anchor_index: usize,
     global_worker_cap: usize,
 ) -> Option<ScaleOperation> {
-    if controls.iter().any(|control| control.settling) {
+    if support_growth_is_settling(controls, anchor_index) {
         return None;
     }
 
@@ -2683,6 +2683,14 @@ fn choose_anchor_probe_operation(
     }
 
     None
+}
+
+fn support_growth_is_settling(controls: &[StageControl], anchor_index: usize) -> bool {
+    controls.iter().enumerate().any(|(stage_index, control)| {
+        stage_index != anchor_index
+            && control.settling
+            && matches!(control.last_operation, Some((ScaleDirection::Add, _)))
+    })
 }
 
 fn choose_support_operation(
@@ -3239,6 +3247,59 @@ mod tests {
             controls[0].anchor.as_ref().unwrap().last_probe_reason,
             AnchorProbeReason::OutputBackpressure
         );
+    }
+
+    #[test]
+    fn support_shrink_settling_does_not_block_anchor_probe_decision() {
+        let active = vec![vec![0], vec![1, 2, 3]];
+        let links = vec![
+            link(QueueTrend::Stable),
+            link(QueueTrend::Stable),
+            link(QueueTrend::Stable),
+        ];
+        let mut controls = vec![support_control(), anchor_control(4)];
+        controls[0].settling = true;
+        controls[0].last_operation = Some((ScaleDirection::Remove, Instant::now()));
+        controls[1].scaling_state = StageScalingState::Probing;
+        controls[1].anchor.as_mut().unwrap().probe = Some(AnchorProbe {
+            worker_id: 3,
+            samples: PROBE_SETTLE_SAMPLES,
+            observed_work: true,
+        });
+
+        assert!(choose_anchor_probe_operation(&links, &active, &mut controls, 1, 8).is_none());
+        let anchor = controls[1].anchor.as_ref().unwrap();
+        assert!(anchor.probe.is_none());
+        assert_eq!(anchor.last_probe_outcome, AnchorProbeOutcome::Kept);
+        assert_eq!(anchor.last_probe_reason, AnchorProbeReason::None);
+        assert_eq!(anchor.cooldown_samples, 2);
+        assert_eq!(controls[1].scaling_state, StageScalingState::Eligible);
+    }
+
+    #[test]
+    fn support_growth_settling_still_blocks_anchor_probe_decision() {
+        let active = vec![vec![0], vec![1, 2, 3]];
+        let links = vec![
+            link(QueueTrend::Stable),
+            link(QueueTrend::Stable),
+            link(QueueTrend::Stable),
+        ];
+        let mut controls = vec![support_control(), anchor_control(4)];
+        controls[0].settling = true;
+        controls[0].last_operation = Some((ScaleDirection::Add, Instant::now()));
+        controls[1].scaling_state = StageScalingState::Probing;
+        controls[1].anchor.as_mut().unwrap().probe = Some(AnchorProbe {
+            worker_id: 3,
+            samples: PROBE_SETTLE_SAMPLES,
+            observed_work: true,
+        });
+
+        assert!(choose_anchor_probe_operation(&links, &active, &mut controls, 1, 8).is_none());
+        let anchor = controls[1].anchor.as_ref().unwrap();
+        assert!(anchor.probe.is_some());
+        assert_eq!(anchor.last_probe_outcome, AnchorProbeOutcome::None);
+        assert_eq!(anchor.cooldown_samples, 0);
+        assert_eq!(controls[1].scaling_state, StageScalingState::Probing);
     }
 
     #[test]
