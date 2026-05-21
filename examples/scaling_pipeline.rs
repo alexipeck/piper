@@ -152,7 +152,7 @@ pipeline! {
             Normalize.with_reusable_output(|| Vec::<u64>::with_capacity(BATCH_SIZE)),
             anchor(Compute)
                 .max_threads(max_parallelism())
-                .initial_threads(half_max_parallelism())
+                .initial_threads(max_parallelism().div_ceil(2).max(1))
                 .with_reusable_output(|| Vec::<u64>::with_capacity(BATCH_SIZE)),
             Emit,
         ];
@@ -164,10 +164,6 @@ fn max_parallelism() -> usize {
         .map(|value| value.get())
         .unwrap_or(1)
         .max(1)
-}
-
-fn half_max_parallelism() -> usize {
-    max_parallelism().div_ceil(2).max(1)
 }
 
 fn output_drainers() -> usize {
