@@ -102,8 +102,31 @@ pipeline! {
     }
 }
 
+pipeline! {
+    pub struct GraphPipeline {
+        type Input = u8;
+        type Output = u16;
+        type Error = MacroError;
+
+        config = config();
+        stages = {
+            widen = anchor(Widen).max_threads(1),
+            left = stage("left", Keep),
+            right = anchor(stage("right", Keep)).fixed_threads(1),
+            out = stage("out", Keep),
+        };
+        graph = {
+            input -> widen;
+            widen -> [left, right];
+            [left, right] -> out;
+            out -> output;
+        };
+    }
+}
+
 fn main() {
     let _ = DirectPipeline::start;
     let _ = NamedPipeline::start;
     let _ = InlinePipeline::start;
+    let _ = GraphPipeline::start;
 }

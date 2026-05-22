@@ -410,6 +410,7 @@
     </label>
     <input type="text" class="csv-path" id="csvPathInput" placeholder="C:\full\path\to\file.csv">
     <button type="button" id="csvPathLoad">Load path</button>
+    <button type="button" id="clearSaved">Clear saved</button>
     <span class="drop-hint" id="dropHint">Session saves path and settings — reload restores via path field</span>
     <label><input type="checkbox" id="logScale"> Log Y</label>
     <label><input type="checkbox" id="showAllRows" checked> Show all rows</label>
@@ -609,6 +610,7 @@
     const fileInputLabel = document.getElementById("fileInputLabel");
     const csvPathInput = document.getElementById("csvPathInput");
     const csvPathLoad = document.getElementById("csvPathLoad");
+    const clearSaved = document.getElementById("clearSaved");
     const dropHint = document.getElementById("dropHint");
     const logScaleEl = document.getElementById("logScale");
     const showAllRowsEl = document.getElementById("showAllRows");
@@ -925,13 +927,14 @@
 
     function localFileAccessHint() {
       if (location.protocol !== "file:") return "";
-      return " From file://, Chromium may need --allow-file-access-from-files, or place the CSV next to this HTML file.";
+      return " Browser security may block path loading from file://. Use Choose file, or serve this directory with `python3 -m http.server` and open the viewer through localhost.";
     }
 
     function loadCsvFromPath(pathParam, savedConfig, opts = {}) {
       const path = pathParam.trim();
       if (!path) return;
-      state.csvPath = path;
+      const previousPath = state.csvPath;
+      statusEl.textContent = `Loading: ${path}`;
       csvPathInput.value = path;
       const targets = csvFetchTargets(path);
       const tryFallback = () => {
@@ -946,7 +949,11 @@
           loadCsvText(cached, path, savedConfig);
           return;
         }
-        statusEl.textContent = `Could not load: ${path}.${localFileAccessHint()}`;
+        const shown =
+          state.headers.length && previousPath && pathKey(previousPath) !== pathKey(path)
+            ? ` Still showing: ${previousPath}.`
+            : "";
+        statusEl.textContent = `Could not load: ${path}.${shown}${localFileAccessHint()}`;
       };
       const tryNext = (i) => {
         if (i >= targets.length) {
@@ -959,7 +966,10 @@
             return r.text();
           })
           .then((text) => loadCsvText(text, path, savedConfig))
-          .catch(() => tryNext(i + 1));
+          .catch((error) => {
+            console.warn("CSV load failed", targets[i], error);
+            tryNext(i + 1);
+          });
       };
       if (targets.length === 0) {
         tryFallback();
@@ -1005,7 +1015,7 @@
     }
 
     function renderAll() {
-      renderChart();
+      renderChartSafely();
       renderTable();
       renderDetail();
       updateRowControls();
@@ -1284,7 +1294,7 @@
       if (state.plot && chartSeriesIndices().length > 0) {
         applyYRangeToPlot();
       } else {
-        renderChart();
+        renderChartSafely();
       }
       yRangeHint.textContent = formatYRangeHint();
       scheduleStorageSave();
@@ -1297,7 +1307,7 @@
       yMinOverride.value = "";
       yMaxOverride.value = "";
       yRangeHint.textContent = "Y axis auto-scales to data.";
-      renderChart();
+      renderChartSafely();
       scheduleStorageSave();
     }
 
@@ -1416,6 +1426,12 @@
         chartEmpty.hidden = false;
         chartEmpty.textContent =
           "Select numeric columns in the sidebar to plot (e.g. busy_ratio, link lengths).";
+        return;
+      }
+      if (typeof uPlot === "undefined") {
+        destroyChart();
+        chartEmpty.hidden = false;
+        chartEmpty.textContent = "Chart library unavailable. CSV table loaded below.";
         return;
       }
 
@@ -1559,6 +1575,18 @@
       renderChartLegend(series);
       syncChartCursor();
       updateXZoomUi();
+    }
+
+    function renderChartSafely() {
+      try {
+        renderChart();
+      } catch (error) {
+        console.error("Piper CSV chart render failed", error);
+        destroyChart();
+        chartEmpty.hidden = false;
+        const message = error?.message || String(error);
+        chartEmpty.textContent = `Chart unavailable: ${message}. CSV table loaded below.`;
+      }
     }
 
     function resizeChart() {
@@ -1827,8 +1855,9 @@
     function loadCsvFromFile(file) {
       const reader = new FileReader();
       reader.onload = () => {
-        const path = csvPathInput.value.trim() || file.name;
-        loadCsvText(reader.result, path);
+        state.csvPath = file.name;
+        csvPathInput.value = file.name;
+        loadCsvText(reader.result, file.name);
       };
       reader.readAsText(file);
     }
@@ -1844,6 +1873,17 @@
 
     csvPathLoad.addEventListener("click", () => {
       loadCsvFromPath(csvPathInput.value, null);
+    });
+
+    clearSaved.addEventListener("click", () => {
+      try {
+        localStorage.removeItem(STORAGE_KEY);
+        localStorage.removeItem(CSV_CACHE_KEY);
+      } catch (_) {}
+      state.csvPath = null;
+      csvPathInput.value = "";
+      updateFileLabel();
+      statusEl.textContent = "Saved CSV path and cache cleared.";
     });
 
     csvPathInput.addEventListener("keydown", (e) => {
@@ -1872,7 +1912,7 @@
         state.yMax = null;
         yRangeHint.textContent = "Y override cleared (log needs min > 0).";
       }
-      renderChart();
+      renderChartSafely();
       scheduleStorageSave();
     });
 
