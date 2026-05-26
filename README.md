@@ -76,3 +76,11 @@ cargo run --release --example fork_join_pipeline
 ```
 
 See [examples/fork_join_pipeline.rs](examples/fork_join_pipeline.rs) for `Stage` implementations, buffer leases, telemetry, and concurrent output draining. For linear `stages = [ ... ]` sugar without a graph, see [examples/pipeline_api_styles.rs](examples/pipeline_api_styles.rs).
+
+## External node pipeline
+
+Use `external_node(Input, Output)` when Piper should own the graph, channels, telemetry, cancellation, and shutdown while user code owns the worker loop. The runnable example in [examples/external_node_pipeline.rs](examples/external_node_pipeline.rs) forks prepared batches to one managed hash branch and one external hash branch, then joins both branches back into a managed normalize stage.
+
+```bash
+cargo run --release --example external_node_pipeline
+```

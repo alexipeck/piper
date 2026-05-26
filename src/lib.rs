@@ -58,6 +58,9 @@ pub enum PiperError<E: Debug + Display = String> {
     #[error("finalize closure failed in worker `{worker}`: {error}")]
     UserFinalize { worker: String, error: E },
 
+    #[error("external node `{node}` failed: {error}")]
+    ExternalNode { node: String, error: E },
+
     #[error("internal Piper failure in worker `{worker}`: {message}")]
     Internal { worker: String, message: String },
 
@@ -286,6 +289,9 @@ pub struct StageSnapshot {
     pub scaling_state: StageScalingState,
     pub is_anchor: bool,
     pub is_fixed_anchor: bool,
+    pub is_external: bool,
+    pub external_input_rate: f64,
+    pub external_output_rate: f64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -371,6 +377,168 @@ pub enum TryRecvOutputError {
     Empty,
     #[error("Piper output type mismatch")]
     TypeMismatch,
+}
+
+pub struct ExternalNodeToken<In, Out>
+where
+    In: Send + 'static,
+    Out: Send + 'static,
+{
+    index: usize,
+    _marker: PhantomData<fn(In) -> Out>,
+}
+
+impl<In, Out> Clone for ExternalNodeToken<In, Out>
+where
+    In: Send + 'static,
+    Out: Send + 'static,
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<In, Out> Copy for ExternalNodeToken<In, Out>
+where
+    In: Send + 'static,
+    Out: Send + 'static,
+{
+}
+
+impl<In, Out> ExternalNodeToken<In, Out>
+where
+    In: Send + 'static,
+    Out: Send + 'static,
+{
+    pub fn index(self) -> usize {
+        self.index
+    }
+}
+
+pub struct ExternalNode<In, Out, E = String>
+where
+    In: Send + 'static,
+    Out: Send + 'static,
+    E: Debug + Display + Send + 'static,
+{
+    name: String,
+    input: kanal::Receiver<Message>,
+    input_stats: Arc<LinkStats>,
+    output: kanal::Sender<Message>,
+    output_stats: Arc<LinkStats>,
+    shutdown: Arc<AtomicBool>,
+    abort: Arc<AtomicBool>,
+    internal_failure: kanal::Sender<InternalFailure>,
+    _marker: PhantomData<fn(In, Out, E)>,
+}
+
+impl<In, Out, E> Clone for ExternalNode<In, Out, E>
+where
+    In: Send + 'static,
+    Out: Send + 'static,
+    E: Debug + Display + Send + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            input: self.input.clone(),
+            input_stats: Arc::clone(&self.input_stats),
+            output: self.output.clone(),
+            output_stats: Arc::clone(&self.output_stats),
+            shutdown: Arc::clone(&self.shutdown),
+            abort: Arc::clone(&self.abort),
+            internal_failure: self.internal_failure.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<In, Out, E> ExternalNode<In, Out, E>
+where
+    In: Send + 'static,
+    Out: Send + 'static,
+    E: Debug + Display + Send + 'static,
+{
+    pub fn recv(&self) -> std::result::Result<In, RecvOutputError> {
+        let input = self.input.recv().map_err(|_| RecvOutputError::Closed)?;
+        self.input_stats.drains.fetch_add(1, Ordering::Relaxed);
+        input
+            .downcast::<In>()
+            .map(|value| *value)
+            .map_err(|_| RecvOutputError::TypeMismatch)
+    }
+
+    pub fn recv_timeout(&self, duration: Duration) -> std::result::Result<In, RecvOutputError> {
+        let input = self
+            .input
+            .recv_timeout(duration)
+            .map_err(|error| match error {
+                kanal::ReceiveErrorTimeout::Timeout => RecvOutputError::Timeout,
+                kanal::ReceiveErrorTimeout::Closed | kanal::ReceiveErrorTimeout::SendClosed => {
+                    RecvOutputError::Closed
+                }
+            })?;
+        self.input_stats.drains.fetch_add(1, Ordering::Relaxed);
+        input
+            .downcast::<In>()
+            .map(|value| *value)
+            .map_err(|_| RecvOutputError::TypeMismatch)
+    }
+
+    pub fn try_recv(&self) -> std::result::Result<In, TryRecvOutputError> {
+        let input = match self.input.try_recv() {
+            Ok(Some(input)) => input,
+            Ok(None) => return Err(TryRecvOutputError::Empty),
+            Err(kanal::ReceiveError::Closed) | Err(kanal::ReceiveError::SendClosed) => {
+                return Err(TryRecvOutputError::Closed);
+            }
+        };
+        self.input_stats.drains.fetch_add(1, Ordering::Relaxed);
+        input
+            .downcast::<In>()
+            .map(|value| *value)
+            .map_err(|_| TryRecvOutputError::TypeMismatch)
+    }
+
+    pub fn send(&self, output: Out) -> std::result::Result<(), SendInputError> {
+        match self.output.send(Box::new(output)) {
+            Ok(()) => {
+                self.output_stats.arrivals.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(_) => {
+                if !self.shutdown.load(Ordering::Acquire) && !self.abort.load(Ordering::Acquire) {
+                    self.abort.store(true, Ordering::Release);
+                    let _ = self
+                        .internal_failure
+                        .send(InternalFailure::internal(format!(
+                            "external node `{}` output channel closed unexpectedly",
+                            self.name
+                        )));
+                }
+                Err(SendInputError)
+            }
+        }
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
+
+    pub fn is_aborting(&self) -> bool {
+        self.abort.load(Ordering::Acquire)
+    }
+
+    pub fn abort(&self) {
+        self.abort.store(true, Ordering::Release);
+    }
+
+    pub fn fail(&self, error: E) {
+        self.abort.store(true, Ordering::Release);
+        let _ = self
+            .internal_failure
+            .send(InternalFailure::external(self.name.clone(), error));
+    }
 }
 
 pub struct PiperSender<In> {
@@ -1101,10 +1269,10 @@ enum StageFailure<E> {
     Internal(String),
 }
 
-#[derive(Clone, Debug)]
 enum InternalFailure {
     Internal { message: String },
     Telemetry { message: String },
+    External { node: String, error: Message },
 }
 
 impl InternalFailure {
@@ -1117,6 +1285,48 @@ impl InternalFailure {
     fn telemetry(message: impl Into<String>) -> Self {
         InternalFailure::Telemetry {
             message: message.into(),
+        }
+    }
+
+    fn external<E>(node: String, error: E) -> Self
+    where
+        E: Debug + Display + Send + 'static,
+    {
+        InternalFailure::External {
+            node,
+            error: Box::new(error),
+        }
+    }
+}
+
+struct UntypedExternalNode {
+    name: String,
+    input: kanal::Receiver<Message>,
+    input_stats: Arc<LinkStats>,
+    output: kanal::Sender<Message>,
+    output_stats: Arc<LinkStats>,
+    shutdown: Arc<AtomicBool>,
+    abort: Arc<AtomicBool>,
+    internal_failure: kanal::Sender<InternalFailure>,
+}
+
+impl UntypedExternalNode {
+    fn into_typed<In, Out, E>(self) -> ExternalNode<In, Out, E>
+    where
+        In: Send + 'static,
+        Out: Send + 'static,
+        E: Debug + Display + Send + 'static,
+    {
+        ExternalNode {
+            name: self.name,
+            input: self.input,
+            input_stats: self.input_stats,
+            output: self.output,
+            output_stats: self.output_stats,
+            shutdown: self.shutdown,
+            abort: self.abort,
+            internal_failure: self.internal_failure,
+            _marker: PhantomData,
         }
     }
 }
@@ -1171,6 +1381,7 @@ where
     output_link: usize,
     link_count: usize,
     stages: Vec<GraphStageSpec<E>>,
+    external_count: usize,
     _marker: PhantomData<fn(In) -> Out>,
 }
 
@@ -1181,6 +1392,7 @@ where
 {
     link_count: usize,
     stages: Vec<GraphStageSpec<E>>,
+    external_count: usize,
     _marker: PhantomData<fn(In)>,
 }
 
@@ -1193,6 +1405,7 @@ where
         Self {
             link_count: 1,
             stages: Vec::new(),
+            external_count: 0,
             _marker: PhantomData,
         }
     }
@@ -1240,12 +1453,54 @@ where
         let stage = stage_like.into_stage_spec();
         self.stages.push(GraphStageSpec {
             name: stage.name,
-            stage: stage.stage,
+            stage: Some(stage.stage),
             output_acquire_builder: stage.output_acquire_builder,
             anchor: stage.anchor,
             input_link: input.index,
             output_link: output.index,
+            external_index: None,
         });
+    }
+
+    pub fn add_external_node<ExtIn, ExtOut>(
+        &mut self,
+        input: GraphLink<ExtIn>,
+        name: impl Into<String>,
+    ) -> (GraphLink<ExtOut>, ExternalNodeToken<ExtIn, ExtOut>)
+    where
+        ExtIn: Send + 'static,
+        ExtOut: Send + 'static,
+    {
+        let output = self.link();
+        let token = self.add_external_node_to(input, name, output);
+        (output, token)
+    }
+
+    pub fn add_external_node_to<ExtIn, ExtOut>(
+        &mut self,
+        input: GraphLink<ExtIn>,
+        name: impl Into<String>,
+        output: GraphLink<ExtOut>,
+    ) -> ExternalNodeToken<ExtIn, ExtOut>
+    where
+        ExtIn: Send + 'static,
+        ExtOut: Send + 'static,
+    {
+        let token = ExternalNodeToken {
+            index: self.external_count,
+            _marker: PhantomData,
+        };
+        self.external_count += 1;
+        self.stages.push(GraphStageSpec {
+            name: name.into(),
+            stage: None,
+            output_acquire_builder: None,
+            anchor: None,
+            input_link: input.index,
+            output_link: output.index,
+            external_index: Some(token.index),
+        });
+        token
     }
 
     pub fn finish<Out>(self, output: GraphLink<Out>) -> PipelineGraph<In, Out, E>
@@ -1257,6 +1512,7 @@ where
             output_link: output.index,
             link_count: self.link_count.max(output.index + 1),
             stages: self.stages,
+            external_count: self.external_count,
             _marker: PhantomData,
         }
     }
@@ -1277,11 +1533,12 @@ where
     E: Debug + Display + Send + 'static,
 {
     name: String,
-    stage: Arc<dyn DynStage<E>>,
+    stage: Option<Arc<dyn DynStage<E>>>,
     output_acquire_builder: Option<Arc<dyn OutputAcquireBuilder + Send + Sync>>,
     anchor: Option<AnchorHints>,
     input_link: usize,
     output_link: usize,
+    external_index: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -1290,11 +1547,12 @@ where
     E: Debug + Display + Send + 'static,
 {
     name: String,
-    stage: Arc<dyn DynStage<E>>,
+    stage: Option<Arc<dyn DynStage<E>>>,
     output_acquire: Option<DynAcquire>,
     anchor: Option<ResolvedAnchor>,
     input_link: usize,
     output_link: usize,
+    is_external: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1402,6 +1660,7 @@ struct PendingScale {
 }
 
 struct StageControl {
+    is_external: bool,
     processed_count: u64,
     busy_ratio: f64,
     service_time_ewma: f64,
@@ -1505,6 +1764,7 @@ where
     stages
         .iter()
         .map(|stage| StageControl {
+            is_external: stage.is_external,
             processed_count: 0,
             busy_ratio: 0.0,
             service_time_ewma: 0.0,
@@ -1600,6 +1860,7 @@ where
     abort: Arc<AtomicBool>,
     snapshot: Arc<RwLock<PiperSnapshot>>,
     supervisor: Option<JoinHandle<Result<(), E>>>,
+    external_nodes: Vec<Option<UntypedExternalNode>>,
 }
 
 impl<In, Out, E> Piper<In, Out, E>
@@ -1618,6 +1879,7 @@ where
             output_link,
             link_count,
             stages,
+            external_count,
             ..
         } = graph;
 
@@ -1671,10 +1933,33 @@ where
         let input_stats = Arc::clone(&links[input_link].stats);
         let output_stats = Arc::clone(&links[output_link].stats);
 
+        let mut external_nodes: Vec<Option<UntypedExternalNode>> =
+            (0..external_count).map(|_| None).collect();
+        for stage in &stages {
+            if let Some(external_index) = stage.external_index {
+                let output = links[stage.output_link]
+                    .sender
+                    .as_ref()
+                    .expect("external output sender exists")
+                    .clone();
+                external_nodes[external_index] = Some(UntypedExternalNode {
+                    name: stage.name.clone(),
+                    input: links[stage.input_link].receiver.clone(),
+                    input_stats: Arc::clone(&links[stage.input_link].stats),
+                    output,
+                    output_stats: Arc::clone(&links[stage.output_link].stats),
+                    shutdown: Arc::clone(&shutdown),
+                    abort: Arc::clone(&abort),
+                    internal_failure: internal_failure_sender.clone(),
+                });
+            }
+        }
+
         let runtime_stages: Vec<_> = stages
             .into_iter()
             .map(|stage| {
                 let anchor = stage.anchor.map(resolve_anchor_hints).transpose()?;
+                let is_external = stage.external_index.is_some();
                 Ok(RuntimeStage {
                     name: stage.name,
                     stage: stage.stage,
@@ -1684,6 +1969,7 @@ where
                     anchor,
                     input_link: stage.input_link,
                     output_link: stage.output_link,
+                    is_external,
                 })
             })
             .collect::<Result<Vec<_>, E>>()?;
@@ -1722,6 +2008,9 @@ where
                     is_fixed_anchor: stage
                         .anchor
                         .is_some_and(|anchor| anchor.fixed_threads.is_some()),
+                    is_external: stage.is_external,
+                    external_input_rate: 0.0,
+                    external_output_rate: 0.0,
                 })
                 .collect(),
             anchors: runtime_stages
@@ -1798,6 +2087,7 @@ where
             abort,
             snapshot,
             supervisor: Some(supervisor),
+            external_nodes,
         })
     }
 
@@ -1821,8 +2111,24 @@ where
         self.snapshot.read().clone()
     }
 
+    pub fn take_external_node<ExtIn, ExtOut>(
+        &mut self,
+        token: ExternalNodeToken<ExtIn, ExtOut>,
+    ) -> ExternalNode<ExtIn, ExtOut, E>
+    where
+        ExtIn: Send + 'static,
+        ExtOut: Send + 'static,
+    {
+        self.external_nodes
+            .get_mut(token.index)
+            .and_then(Option::take)
+            .unwrap_or_else(|| panic!("external node handle {} is unavailable", token.index))
+            .into_typed()
+    }
+
     pub fn join(mut self) -> Result<(), E> {
         self.shutdown();
+        self.external_nodes.clear();
         if let Some(supervisor) = self.supervisor.take() {
             supervisor
                 .join()
@@ -1977,6 +2283,9 @@ fn csv_header(snapshot: &PiperSnapshot) -> String {
         fields.push(format!("stage{}_scaling_state", stage.index));
         fields.push(format!("stage{}_is_anchor", stage.index));
         fields.push(format!("stage{}_is_fixed_anchor", stage.index));
+        fields.push(format!("stage{}_is_external", stage.index));
+        fields.push(format!("stage{}_external_input_rate", stage.index));
+        fields.push(format!("stage{}_external_output_rate", stage.index));
     }
 
     fields.join(",")
@@ -2034,6 +2343,9 @@ fn csv_row(elapsed: Duration, snapshot: &PiperSnapshot) -> String {
         fields.push(format!("{:?}", stage.scaling_state));
         fields.push(stage.is_anchor.to_string());
         fields.push(stage.is_fixed_anchor.to_string());
+        fields.push(stage.is_external.to_string());
+        fields.push(format!("{:.6}", stage.external_input_rate));
+        fields.push(format!("{:.6}", stage.external_output_rate));
     }
 
     fields.join(",")
@@ -2079,7 +2391,9 @@ where
     let mut last_sample_at = Instant::now();
 
     for stage_index in 0..stages.len() {
-        let active_count = if let Some(anchor) = stages[stage_index].anchor {
+        let active_count = if stages[stage_index].is_external {
+            0
+        } else if let Some(anchor) = stages[stage_index].anchor {
             if let Some(fixed_threads) = anchor.fixed_threads {
                 fixed_threads
             } else {
@@ -2153,6 +2467,16 @@ where
                     message,
                 },
                 InternalFailure::Telemetry { message } => PiperError::Telemetry { message },
+                InternalFailure::External { node, error } => match error.downcast::<E>() {
+                    Ok(error) => PiperError::ExternalNode {
+                        node,
+                        error: *error,
+                    },
+                    Err(_) => PiperError::Internal {
+                        worker: "piper-supervisor".to_string(),
+                        message: format!("external node `{node}` reported an invalid error type"),
+                    },
+                },
             });
             abort.store(true, Ordering::Release);
         }
@@ -2371,9 +2695,10 @@ where
     stages
         .iter()
         .filter(|stage| {
-            !stage
-                .anchor
-                .is_some_and(|anchor| anchor.fixed_threads.is_some())
+            !stage.is_external
+                && !stage
+                    .anchor
+                    .is_some_and(|anchor| anchor.fixed_threads.is_some())
         })
         .count()
 }
@@ -2398,6 +2723,10 @@ where
     let retire = Arc::new(AtomicBool::new(false));
     workers[worker_id].stats.reset();
     let stage = &stages[stage_index];
+    let stage_impl = stage.stage.as_ref().ok_or_else(|| PiperError::Internal {
+        worker: workers[worker_id].name.clone(),
+        message: "cannot assign a managed worker to an external node".to_string(),
+    })?;
     let output = links[stage.output_link]
         .sender
         .as_ref()
@@ -2408,7 +2737,7 @@ where
         .clone();
     let assignment = WorkerAssignment {
         stage_index,
-        stage: Arc::clone(&stage.stage),
+        stage: Arc::clone(stage_impl),
         input: links[stage.input_link].receiver.clone(),
         input_stats: Arc::clone(&links[stage.input_link].stats),
         output,
@@ -2894,6 +3223,10 @@ fn update_desired_workers<E>(
     E: Debug + Display + Send + 'static,
 {
     for stage_index in 0..controls.len() {
+        if controls[stage_index].is_external {
+            controls[stage_index].desired_workers = 0;
+            continue;
+        }
         let active = active_by_stage[stage_index].len().max(1);
         let input = &links[stages[stage_index].input_link];
         let throughput = controls[stage_index].per_worker_throughput;
@@ -3277,10 +3610,11 @@ fn link_underfeeds_stage(link: &LinkControl, active_threads: usize) -> bool {
 }
 
 fn stage_can_scale(control: &StageControl) -> bool {
-    !control
-        .anchor
-        .as_ref()
-        .is_some_and(|anchor| anchor.fixed_threads.is_some())
+    !control.is_external
+        && !control
+            .anchor
+            .as_ref()
+            .is_some_and(|anchor| anchor.fixed_threads.is_some())
         && !control.settling
         && !matches!(
             control.scaling_state,
@@ -3454,6 +3788,17 @@ fn update_snapshot<E>(
                 .anchor
                 .as_ref()
                 .is_some_and(|anchor| anchor.fixed_threads.is_some()),
+            is_external: stage.is_external,
+            external_input_rate: if stage.is_external {
+                link_controls[stage.input_link].drain_rate
+            } else {
+                0.0
+            },
+            external_output_rate: if stage.is_external {
+                link_controls[stage.output_link].arrival_rate
+            } else {
+                0.0
+            },
         })
         .collect();
     snapshot.anchors = controls
@@ -3536,6 +3881,7 @@ mod tests {
 
     fn support_control() -> StageControl {
         StageControl {
+            is_external: false,
             processed_count: 0,
             busy_ratio: 0.0,
             service_time_ewma: 1_000_000.0,
@@ -3591,11 +3937,12 @@ mod tests {
         (0..count)
             .map(|index| RuntimeStage {
                 name: format!("stage{index}"),
-                stage: Arc::new(StageAdapter { stage: TestStage }),
+                stage: Some(Arc::new(StageAdapter { stage: TestStage })),
                 output_acquire: None,
                 anchor: None,
                 input_link: index,
                 output_link: index + 1,
+                is_external: false,
             })
             .collect()
     }

@@ -124,9 +124,38 @@ pipeline! {
     }
 }
 
+pipeline! {
+    pub struct ExternalPipeline {
+        type Input = u8;
+        type Output = u16;
+        type Error = MacroError;
+
+        config = config();
+        stages = {
+            external = external_node(u8, u16),
+        };
+        graph = {
+            input -> external;
+            external -> output;
+        };
+    }
+}
+
+fn external_run_shape(run: ExternalPipelineRun) {
+    let _sender = run.sender();
+    let _receiver = run.receiver();
+    let _external = run.external.clone();
+    run.shutdown();
+    run.abort();
+    let _telemetry = run.get_telemetry();
+    let _join = ExternalPipelineRun::join;
+}
+
 fn main() {
     let _ = DirectPipeline::start;
     let _ = NamedPipeline::start;
     let _ = InlinePipeline::start;
     let _ = GraphPipeline::start;
+    let _ = ExternalPipeline::start;
+    let _ = external_run_shape;
 }

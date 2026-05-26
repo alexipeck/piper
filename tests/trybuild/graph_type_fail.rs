@@ -103,4 +103,23 @@ pipeline! {
     }
 }
 
+pipeline! {
+    pub struct BadExternalPipeline {
+        type Input = u8;
+        type Output = u16;
+        type Error = MacroError;
+
+        config = config();
+        stages = {
+            external = external_node(u8, String),
+            keep = stage("keep", Keep),
+        };
+        graph = {
+            input -> external;
+            external -> keep;
+            keep -> output;
+        };
+    }
+}
+
 fn main() {}

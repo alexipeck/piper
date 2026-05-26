@@ -3,7 +3,10 @@ use quote::{format_ident, quote};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
-use syn::{Expr, Ident, Result, Token, Type, Visibility, braced, bracketed, parse_macro_input};
+use syn::{
+    Expr, Ident, Result, Token, Type, Visibility, braced, bracketed, parenthesized,
+    parse_macro_input,
+};
 
 struct PipelineInput {
     vis: Visibility,
@@ -23,7 +26,24 @@ enum StageDecls {
 
 struct NamedStage {
     name: Ident,
-    expr: Expr,
+    kind: NamedStageKind,
+}
+
+enum NamedStageKind {
+    Managed(Expr),
+    External { input: Type, output: Type },
+}
+
+struct GraphExpansion {
+    build_graph: proc_macro2::TokenStream,
+    external_nodes: Vec<ExternalNodeDecl>,
+}
+
+struct ExternalNodeDecl {
+    name: Ident,
+    input: Type,
+    output: Type,
+    token_ident: Ident,
 }
 
 #[derive(Clone)]
@@ -83,8 +103,33 @@ impl Parse for NamedStage {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let name = input.parse()?;
         input.parse::<Token![=]>()?;
+        if input.peek(Ident) {
+            let fork = input.fork();
+            let ident: Ident = fork.parse()?;
+            if ident == "external_node" && fork.peek(syn::token::Paren) {
+                input.parse::<Ident>()?;
+                let content;
+                parenthesized!(content in input);
+                let input_type = content.parse()?;
+                content.parse::<Token![,]>()?;
+                let output_type = content.parse()?;
+                if !content.is_empty() {
+                    return Err(content.error("expected exactly two external node types"));
+                }
+                return Ok(NamedStage {
+                    name,
+                    kind: NamedStageKind::External {
+                        input: input_type,
+                        output: output_type,
+                    },
+                });
+            }
+        }
         let expr = input.parse()?;
-        Ok(NamedStage { name, expr })
+        Ok(NamedStage {
+            name,
+            kind: NamedStageKind::Managed(expr),
+        })
     }
 }
 
@@ -204,7 +249,7 @@ pub fn pipeline(input: TokenStream) -> TokenStream {
         graph,
     } = parse_macro_input!(input as PipelineInput);
 
-    let build_graph = match (stages, graph) {
+    let expansion = match (stages, graph) {
         (StageDecls::Linear(stages), None) => expand_linear_graph(&input, &output, &error, stages),
         (StageDecls::Named(stages), Some(edges)) => {
             match expand_named_graph(&input, &output, &error, stages, edges) {
@@ -227,17 +272,96 @@ pub fn pipeline(input: TokenStream) -> TokenStream {
         }
     };
 
-    quote! {
-        #vis struct #name;
+    let build_graph = expansion.build_graph;
 
-        impl #name {
-            pub fn start() -> ::piper::Result<::piper::Piper<#input, #output, #error>, #error> {
-                #build_graph
-                ::piper::Piper::start(#config, __piper_graph)
+    if expansion.external_nodes.is_empty() {
+        quote! {
+            #vis struct #name;
+
+            impl #name {
+                pub fn start() -> ::piper::Result<::piper::Piper<#input, #output, #error>, #error> {
+                    #build_graph
+                    ::piper::Piper::start(#config, __piper_graph)
+                }
             }
         }
+        .into()
+    } else {
+        let run_name = format_ident!("{name}Run");
+        let external_fields = expansion.external_nodes.iter().map(|external| {
+            let field = &external.name;
+            let input = &external.input;
+            let output = &external.output;
+            quote! {
+                pub #field: ::piper::ExternalNode<#input, #output, #error>
+            }
+        });
+        let external_takes = expansion.external_nodes.iter().map(|external| {
+            let field = &external.name;
+            let token = &external.token_ident;
+            quote! {
+                let #field = __piper.take_external_node(#token);
+            }
+        });
+        let external_names: Vec<_> = expansion
+            .external_nodes
+            .iter()
+            .map(|external| &external.name)
+            .collect();
+
+        quote! {
+            #vis struct #name;
+
+            #vis struct #run_name {
+                pub piper: ::piper::Piper<#input, #output, #error>,
+                #(#external_fields,)*
+            }
+
+            impl #name {
+                pub fn start() -> ::piper::Result<#run_name, #error> {
+                    #build_graph
+                    let mut __piper = ::piper::Piper::start(#config, __piper_graph)?;
+                    #(#external_takes)*
+                    Ok(#run_name {
+                        piper: __piper,
+                        #(#external_names,)*
+                    })
+                }
+            }
+
+            impl #run_name {
+                pub fn sender(&self) -> ::piper::PiperSender<#input> {
+                    self.piper.sender()
+                }
+
+                pub fn receiver(&self) -> ::piper::PiperReceiver<#output> {
+                    self.piper.receiver()
+                }
+
+                pub fn shutdown(&self) {
+                    self.piper.shutdown();
+                }
+
+                pub fn abort(&self) {
+                    self.piper.abort();
+                }
+
+                pub fn get_telemetry(&self) -> ::piper::PiperSnapshot {
+                    self.piper.get_telemetry()
+                }
+
+                pub fn join(self) -> ::piper::Result<(), #error> {
+                    let #run_name {
+                        piper,
+                        #(#external_names,)*
+                    } = self;
+                    drop((#(#external_names,)*));
+                    piper.join()
+                }
+            }
+        }
+        .into()
     }
-    .into()
 }
 
 fn expand_linear_graph(
@@ -245,7 +369,7 @@ fn expand_linear_graph(
     output: &Type,
     error: &Type,
     stages: Vec<Expr>,
-) -> proc_macro2::TokenStream {
+) -> GraphExpansion {
     let mut tokens = quote! {
         let mut __piper_builder = ::piper::PipelineGraphBuilder::<#input, #error>::new();
         let __piper_link_0 = __piper_builder.input();
@@ -261,7 +385,10 @@ fn expand_linear_graph(
     tokens.extend(quote! {
         let __piper_graph = __piper_builder.finish::<#output>(#previous);
     });
-    tokens
+    GraphExpansion {
+        build_graph: tokens,
+        external_nodes: Vec::new(),
+    }
 }
 
 fn expand_named_graph(
@@ -270,7 +397,7 @@ fn expand_named_graph(
     error: &Type,
     stages: Vec<NamedStage>,
     edges: Vec<Edge>,
-) -> Result<proc_macro2::TokenStream> {
+) -> Result<GraphExpansion> {
     let declared: HashSet<String> = stages.iter().map(|stage| stage.name.to_string()).collect();
     let mut parent = HashMap::<String, String>::new();
     let mut used_inputs = HashSet::<String>::new();
@@ -363,9 +490,9 @@ fn expand_named_graph(
     }
 
     let mut stage_decls = quote! {};
+    let mut external_nodes = Vec::new();
     for stage in stages {
         let name = stage.name;
-        let expr = stage.expr;
         let in_root = find(&mut parent, &format!("{name}:in"));
         let out_root = find(&mut parent, &format!("{name}:out"));
         let in_link = root_to_ident
@@ -374,18 +501,38 @@ fn expand_named_graph(
         let out_link = root_to_ident
             .get(&out_root)
             .expect("stage output root exists");
-        stage_decls.extend(quote! {
-            let #name = #expr;
-            __piper_builder.add_stage_to(#in_link, #name, #out_link);
-        });
+        match stage.kind {
+            NamedStageKind::Managed(expr) => {
+                stage_decls.extend(quote! {
+                    let #name = #expr;
+                    __piper_builder.add_stage_to(#in_link, #name, #out_link);
+                });
+            }
+            NamedStageKind::External { input, output } => {
+                let token_ident = format_ident!("__piper_external_{name}");
+                stage_decls.extend(quote! {
+                    let #token_ident = __piper_builder
+                        .add_external_node_to::<#input, #output>(#in_link, stringify!(#name), #out_link);
+                });
+                external_nodes.push(ExternalNodeDecl {
+                    name,
+                    input,
+                    output,
+                    token_ident,
+                });
+            }
+        }
     }
 
-    Ok(quote! {
-        let mut __piper_builder = ::piper::PipelineGraphBuilder::<#input, #error>::new();
-        #link_decls
-        #stage_decls
-        let __piper_graph = __piper_builder.finish::<#output>(#output_link);
-        let _ = #input_link;
+    Ok(GraphExpansion {
+        build_graph: quote! {
+            let mut __piper_builder = ::piper::PipelineGraphBuilder::<#input, #error>::new();
+            #link_decls
+            #stage_decls
+            let __piper_graph = __piper_builder.finish::<#output>(#output_link);
+            let _ = #input_link;
+        },
+        external_nodes,
     })
 }
 

@@ -1,0 +1,36 @@
+error[E0308]: mismatched types
+   --> tests/trybuild/graph_type_fail.rs:86:1
+    |
+ 86 | / pipeline! {
+ 87 | |     pub struct BadJoinPipeline {
+ 88 | |         type Input = u8;
+ 89 | |         type Output = u16;
+...   |
+104 | | }
+    | | ^
+    | | |
+    | | expected `GraphLink<String>`, found `GraphLink<u16>`
+    | |_here the type of `__piper_link_2` is inferred to be `GraphLink<u16>`
+    |   arguments to this method are incorrect
+    |
+    = note: expected struct `GraphLink<String>`
+               found struct `GraphLink<u16>`
+note: method defined here
+   --> src/lib.rs
+    |
+    |     pub fn add_stage_to<S>(
+    |            ^^^^^^^^^^^^
+    = note: this error originates in the macro `pipeline` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0271]: type mismatch resolving `<StageSpec<u16, u16, MacroError> as IntoStageSpec<MacroError>>::Input == String`
+   --> tests/trybuild/graph_type_fail.rs:106:1
+    |
+106 | / pipeline! {
+107 | |     pub struct BadExternalPipeline {
+108 | |         type Input = u8;
+109 | |         type Output = u16;
+...   |
+123 | | }
+    | |_^ expected `String`, found `u16`
+    |
+    = note: this error originates in the macro `pipeline` (in Nightly builds, run with -Z macro-backtrace for more info)

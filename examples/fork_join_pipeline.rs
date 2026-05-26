@@ -246,7 +246,9 @@ fn main() -> piper::Result<(), ExampleError> {
 
     producer.join().expect("producer thread should not panic");
     for drainer in output_drainers {
-        drainer.join().expect("output drainer thread should not panic");
+        drainer
+            .join()
+            .expect("output drainer thread should not panic");
     }
     let received = received_batches.load(Ordering::Relaxed);
     piper.shutdown();

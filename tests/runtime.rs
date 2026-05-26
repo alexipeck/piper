@@ -1,6 +1,6 @@
 use piper::{
     CsvTelemetryConfig, IntoStageSpec, PipelineGraph, PipelineGraphBuilder, Piper, PiperConfig,
-    PiperError, Stage, StageContext, anchor, inline_stage, stage,
+    PiperError, Stage, StageContext, anchor, inline_stage, pipeline, stage,
 };
 use std::fs;
 use std::sync::Arc;
@@ -89,6 +89,25 @@ impl Stage for Pass {
     ) -> std::result::Result<(), Self::Error> {
         ctx.emit(input);
         Ok(())
+    }
+}
+
+pipeline! {
+    struct ExternalJoinPipeline {
+        type Input = u32;
+        type Output = u32;
+        type Error = TestError;
+
+        config = config();
+        stages = {
+            external = external_node(u32, u32),
+            pass = stage("pass", Pass),
+        };
+        graph = {
+            input -> external;
+            external -> pass;
+            pass -> output;
+        };
     }
 }
 
@@ -295,6 +314,121 @@ fn fork_join_graph_work_shares_and_merges_outputs() {
     );
     assert_eq!(piper.get_telemetry().anchors.len(), 1);
     assert_eq!(piper.get_telemetry().anchors[0].fixed_threads, Some(1));
+    piper.join().unwrap();
+}
+
+#[test]
+fn external_node_bridges_user_loop_into_managed_stage() {
+    let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
+    let input = builder.input();
+    let external_output = builder.link::<u32>();
+    let external_token =
+        builder.add_external_node_to::<u32, u32>(input, "external", external_output);
+    let output = builder.add_stage(external_output, stage("pass", Pass));
+    let mut piper = Piper::<u32, u32, TestError>::start(config(), builder.finish(output)).unwrap();
+    let external = piper.take_external_node(external_token);
+
+    let worker = std::thread::spawn(move || {
+        loop {
+            match external.recv_timeout(Duration::from_millis(5)) {
+                Ok(value) => external.send(value + 1).unwrap(),
+                Err(piper::RecvOutputError::Timeout) if external.is_shutting_down() => break,
+                Err(piper::RecvOutputError::Timeout) => continue,
+                Err(piper::RecvOutputError::Closed) => break,
+                Err(error) => panic!("external recv failed: {error}"),
+            }
+        }
+    });
+
+    piper.sender().send(41).unwrap();
+    piper.shutdown();
+    assert_eq!(
+        piper
+            .receiver()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap(),
+        42
+    );
+    worker.join().unwrap();
+    piper.join().unwrap();
+}
+
+#[test]
+fn external_node_failure_is_reported_from_join() {
+    let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
+    let input = builder.input();
+    let output = builder.link::<u32>();
+    let external_token = builder.add_external_node_to::<u32, u32>(input, "external", output);
+    let mut piper = Piper::<u32, u32, TestError>::start(config(), builder.finish(output)).unwrap();
+    let external = piper.take_external_node(external_token);
+
+    external.fail(TestError::Test);
+    drop(external);
+    let error = piper.join().expect_err("external failure should fail join");
+    assert!(matches!(
+        error,
+        PiperError::ExternalNode {
+            node,
+            error: TestError::Test
+        } if node == "external"
+    ));
+}
+
+#[test]
+fn join_drops_canonical_external_handles_before_supervisor_join() {
+    let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
+    let input = builder.input();
+    let output = builder.link::<u32>();
+    let _external_token = builder.add_external_node_to::<u32, u32>(input, "external", output);
+    let piper = Piper::<u32, u32, TestError>::start(config(), builder.finish(output)).unwrap();
+
+    piper.join().unwrap();
+}
+
+#[test]
+fn generated_run_join_drops_external_handles_before_supervisor_join() {
+    let run = ExternalJoinPipeline::start().unwrap();
+
+    run.join().unwrap();
+}
+
+#[test]
+fn external_node_telemetry_uses_link_rates() {
+    let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
+    let input = builder.input();
+    let output = builder.link::<u32>();
+    let external_token = builder.add_external_node_to::<u32, u32>(input, "external", output);
+    let mut piper = Piper::<u32, u32, TestError>::start(config(), builder.finish(output)).unwrap();
+    let external = piper.take_external_node(external_token);
+
+    piper.sender().send(7).unwrap();
+    let value = external.recv_timeout(Duration::from_secs(1)).unwrap();
+    external.send(value + 1).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+
+    let telemetry = piper.get_telemetry();
+    let external_stage = telemetry
+        .stages
+        .iter()
+        .find(|stage| stage.name == "external")
+        .unwrap();
+    assert!(external_stage.is_external);
+    assert_eq!(external_stage.active_threads, 0);
+    assert_eq!(external_stage.busy_ratio, 0.0);
+    assert_eq!(external_stage.service_time, Duration::ZERO);
+    assert_eq!(external_stage.per_worker_throughput, 0.0);
+    assert!(external_stage.external_input_rate > 0.0);
+    assert!(external_stage.external_output_rate > 0.0);
+
+    assert_eq!(
+        piper
+            .receiver()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap(),
+        8
+    );
+    piper.shutdown();
+    drop(external);
     piper.join().unwrap();
 }
 
