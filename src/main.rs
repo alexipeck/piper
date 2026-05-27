@@ -53,8 +53,8 @@ const DEFAULT_BUFFER_POOL_MULTIPLIER: usize = 2;
 
 type Sample = (u8, f32);
 type Msg = Vec<Sample>;
-type BufferSender = piper::kanal::Sender<Msg>;
-type BufferReceiver = piper::kanal::Receiver<Msg>;
+type BufferSender = piper::channel::Sender<Msg>;
+type BufferReceiver = piper::channel::Receiver<Msg>;
 
 fn main() -> Result<()> {
     let max_batch_size = configured_max_batch_size();
@@ -237,7 +237,7 @@ fn create_buffer_pool(
     max_batch_size: usize,
     buffer_pool_size: usize,
 ) -> Result<(BufferSender, BufferReceiver)> {
-    let (sender, receiver) = piper::kanal::unbounded::<Msg>();
+    let (sender, receiver) = piper::channel::unbounded::<Msg>();
     for _ in 0..buffer_pool_size {
         sender
             .send(Vec::with_capacity(max_batch_size))
@@ -252,7 +252,7 @@ fn return_buffer(sender: &BufferSender, mut buffer: Msg) {
 }
 
 fn send_sample_batches(
-    sender: piper::kanal::Sender<Msg>,
+    sender: piper::channel::Sender<Msg>,
     samples: Arc<Vec<Sample>>,
     buffer_receiver: BufferReceiver,
     max_batch_size: usize,

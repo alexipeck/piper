@@ -1,3 +1,6 @@
+#[cfg(not(any(feature = "channel-kanal", feature = "channel-crossbeam")))]
+compile_error!("enable `channel-kanal` or `channel-crossbeam`");
+
 use parking_lot::RwLock;
 use std::any::Any;
 use std::fmt::{Debug, Display};
@@ -11,7 +14,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
-pub use kanal;
+pub mod channel;
 pub use parking_lot;
 pub use piper_macros::pipeline;
 
@@ -79,7 +82,7 @@ pub struct Pipe<Msg, Output, UserErr = String>
 where
     UserErr: Debug + Display + Send + 'static,
 {
-    sender: kanal::Sender<Msg>,
+    sender: channel::Sender<Msg>,
     workers: Vec<(
         String,
         JoinHandle<std::result::Result<Output, PiperError<UserErr>>>,
@@ -108,7 +111,7 @@ where
             return Err(PiperError::ZeroWorkers);
         }
 
-        let (sender, receiver) = kanal::unbounded::<Msg>();
+        let (sender, receiver) = channel::unbounded::<Msg>();
         let init = Arc::new(init);
         let process = Arc::new(process);
         let finalize = Arc::new(finalize);
@@ -143,9 +146,8 @@ where
                                         error,
                                     }
                                 })?,
-                                Err(kanal::ReceiveErrorTimeout::Timeout) => continue,
-                                Err(kanal::ReceiveErrorTimeout::Closed)
-                                | Err(kanal::ReceiveErrorTimeout::SendClosed) => break,
+                                Err(channel::RecvTimeoutError::Timeout) => continue,
+                                Err(channel::RecvTimeoutError::Closed) => break,
                             }
                         }
                         finalize(storage).map_err(|error| PiperError::UserFinalize {
@@ -167,7 +169,7 @@ where
         Ok(Pipe { sender, workers })
     }
 
-    pub fn sender(&self) -> kanal::Sender<Msg> {
+    pub fn sender(&self) -> channel::Sender<Msg> {
         self.sender.clone()
     }
 
@@ -422,13 +424,13 @@ where
     E: Debug + Display + Send + 'static,
 {
     name: String,
-    input: kanal::Receiver<Message>,
+    input: channel::Receiver<Message>,
     input_stats: Arc<LinkStats>,
-    output: kanal::Sender<Message>,
+    output: channel::Sender<Message>,
     output_stats: Arc<LinkStats>,
     shutdown: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
-    internal_failure: kanal::Sender<InternalFailure>,
+    internal_failure: channel::Sender<InternalFailure>,
     _marker: PhantomData<fn(In, Out, E)>,
 }
 
@@ -473,10 +475,8 @@ where
             .input
             .recv_timeout(duration)
             .map_err(|error| match error {
-                kanal::ReceiveErrorTimeout::Timeout => RecvOutputError::Timeout,
-                kanal::ReceiveErrorTimeout::Closed | kanal::ReceiveErrorTimeout::SendClosed => {
-                    RecvOutputError::Closed
-                }
+                channel::RecvTimeoutError::Timeout => RecvOutputError::Timeout,
+                channel::RecvTimeoutError::Closed => RecvOutputError::Closed,
             })?;
         self.input_stats.drains.fetch_add(1, Ordering::Relaxed);
         input
@@ -487,11 +487,9 @@ where
 
     pub fn try_recv(&self) -> std::result::Result<In, TryRecvOutputError> {
         let input = match self.input.try_recv() {
-            Ok(Some(input)) => input,
-            Ok(None) => return Err(TryRecvOutputError::Empty),
-            Err(kanal::ReceiveError::Closed) | Err(kanal::ReceiveError::SendClosed) => {
-                return Err(TryRecvOutputError::Closed);
-            }
+            Ok(input) => input,
+            Err(channel::TryRecvError::Empty) => return Err(TryRecvOutputError::Empty),
+            Err(channel::TryRecvError::Closed) => return Err(TryRecvOutputError::Closed),
         };
         self.input_stats.drains.fetch_add(1, Ordering::Relaxed);
         input
@@ -542,7 +540,7 @@ where
 }
 
 pub struct PiperSender<In> {
-    inner: kanal::Sender<Message>,
+    inner: channel::Sender<Message>,
     stats: Arc<LinkStats>,
     shutdown: Arc<AtomicBool>,
     _marker: PhantomData<fn(In)>,
@@ -580,7 +578,7 @@ where
 }
 
 pub struct PiperReceiver<Out> {
-    inner: kanal::Receiver<Message>,
+    inner: channel::Receiver<Message>,
     stats: Arc<LinkStats>,
     _marker: PhantomData<fn() -> Out>,
 }
@@ -613,10 +611,8 @@ where
             .inner
             .recv_timeout(duration)
             .map_err(|error| match error {
-                kanal::ReceiveErrorTimeout::Timeout => RecvOutputError::Timeout,
-                kanal::ReceiveErrorTimeout::Closed | kanal::ReceiveErrorTimeout::SendClosed => {
-                    RecvOutputError::Closed
-                }
+                channel::RecvTimeoutError::Timeout => RecvOutputError::Timeout,
+                channel::RecvTimeoutError::Closed => RecvOutputError::Closed,
             })?;
         self.stats.drains.fetch_add(1, Ordering::Relaxed);
         output
@@ -627,11 +623,9 @@ where
 
     pub fn try_recv(&self) -> std::result::Result<Out, TryRecvOutputError> {
         let output = match self.inner.try_recv() {
-            Ok(Some(output)) => output,
-            Ok(None) => return Err(TryRecvOutputError::Empty),
-            Err(kanal::ReceiveError::Closed) | Err(kanal::ReceiveError::SendClosed) => {
-                return Err(TryRecvOutputError::Closed);
-            }
+            Ok(output) => output,
+            Err(channel::TryRecvError::Empty) => return Err(TryRecvOutputError::Empty),
+            Err(channel::TryRecvError::Closed) => return Err(TryRecvOutputError::Closed),
         };
         self.stats.drains.fetch_add(1, Ordering::Relaxed);
         output
@@ -655,7 +649,7 @@ impl<T> Recycle for Vec<T> {
 struct LeaseRuntime {
     shutdown: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
-    internal_failure: kanal::Sender<InternalFailure>,
+    internal_failure: channel::Sender<InternalFailure>,
 }
 
 pub struct BufferLease<T>
@@ -663,7 +657,7 @@ where
     T: Recycle + Send + 'static,
 {
     value: Option<T>,
-    recycle_sender: kanal::Sender<T>,
+    recycle_sender: channel::Sender<T>,
     runtime: LeaseRuntime,
 }
 
@@ -671,7 +665,7 @@ impl<T> BufferLease<T>
 where
     T: Recycle + Send + 'static,
 {
-    fn new(value: T, recycle_sender: kanal::Sender<T>, runtime: LeaseRuntime) -> Self {
+    fn new(value: T, recycle_sender: channel::Sender<T>, runtime: LeaseRuntime) -> Self {
         Self {
             value: Some(value),
             recycle_sender,
@@ -746,12 +740,12 @@ where
     Out: Send + 'static,
     E: Debug + Display + Send + 'static,
 {
-    output: kanal::Sender<Message>,
+    output: channel::Sender<Message>,
     output_stats: Arc<LinkStats>,
     output_acquire: Option<Arc<AcquireFn<Out>>>,
     shutdown: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
-    internal_failure: kanal::Sender<InternalFailure>,
+    internal_failure: channel::Sender<InternalFailure>,
     _marker: PhantomData<fn(E)>,
 }
 
@@ -831,12 +825,12 @@ where
 }
 
 struct RuntimeStageContext {
-    output: kanal::Sender<Message>,
+    output: channel::Sender<Message>,
     output_stats: Arc<LinkStats>,
     output_acquire: Option<DynAcquire>,
     shutdown: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
-    internal_failure: kanal::Sender<InternalFailure>,
+    internal_failure: channel::Sender<InternalFailure>,
 }
 
 struct StageAdapter<S>
@@ -1248,12 +1242,12 @@ where
     T: Recycle + Send + 'static,
 {
     fn build(&self, runtime: LeaseRuntime) -> DynAcquire {
-        let (recycle_sender, recycle_receiver) = kanal::unbounded::<T>();
+        let (recycle_sender, recycle_receiver) = channel::unbounded::<T>();
         let factory = Arc::clone(&self.factory);
         let acquire: Arc<AcquireFn<BufferLease<T>>> = Arc::new(move || {
             let value = match recycle_receiver.try_recv() {
-                Ok(Some(value)) => value,
-                Ok(None) | Err(_) => factory(),
+                Ok(value) => value,
+                Err(_) => factory(),
             };
             BufferLease::new(value, recycle_sender.clone(), runtime.clone())
         });
@@ -1301,13 +1295,13 @@ impl InternalFailure {
 
 struct UntypedExternalNode {
     name: String,
-    input: kanal::Receiver<Message>,
+    input: channel::Receiver<Message>,
     input_stats: Arc<LinkStats>,
-    output: kanal::Sender<Message>,
+    output: channel::Sender<Message>,
     output_stats: Arc<LinkStats>,
     shutdown: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
-    internal_failure: kanal::Sender<InternalFailure>,
+    internal_failure: channel::Sender<InternalFailure>,
 }
 
 impl UntypedExternalNode {
@@ -1332,8 +1326,8 @@ impl UntypedExternalNode {
 }
 
 struct Link {
-    sender: Option<kanal::Sender<Message>>,
-    receiver: kanal::Receiver<Message>,
+    sender: Option<channel::Sender<Message>>,
+    receiver: channel::Receiver<Message>,
     stats: Arc<LinkStats>,
 }
 
@@ -1576,9 +1570,9 @@ where
 {
     stage_index: usize,
     stage: Arc<dyn DynStage<E>>,
-    input: kanal::Receiver<Message>,
+    input: channel::Receiver<Message>,
     input_stats: Arc<LinkStats>,
-    output: kanal::Sender<Message>,
+    output: channel::Sender<Message>,
     output_stats: Arc<LinkStats>,
     output_acquire: Option<DynAcquire>,
     is_input_stage: bool,
@@ -1586,7 +1580,7 @@ where
     shutdown: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
     poll_interval: Duration,
-    internal_failure: kanal::Sender<InternalFailure>,
+    internal_failure: channel::Sender<InternalFailure>,
     stats: Arc<WorkerStats>,
 }
 
@@ -1615,7 +1609,7 @@ where
     E: Debug + Display + Send + 'static,
 {
     name: String,
-    command: kanal::Sender<WorkerCommand<E>>,
+    command: channel::Sender<WorkerCommand<E>>,
     handle: Option<JoinHandle<()>>,
     active_stage: Option<usize>,
     retire: Option<Arc<AtomicBool>>,
@@ -1907,7 +1901,7 @@ where
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let abort = Arc::new(AtomicBool::new(false));
-        let (internal_failure_sender, internal_failure_receiver) = kanal::unbounded();
+        let (internal_failure_sender, internal_failure_receiver) = channel::unbounded();
         let lease_runtime = LeaseRuntime {
             shutdown: Arc::clone(&shutdown),
             abort: Arc::clone(&abort),
@@ -1916,7 +1910,7 @@ where
 
         let mut links = Vec::with_capacity(link_count);
         for _ in 0..link_count {
-            let (sender, receiver) = kanal::unbounded::<Message>();
+            let (sender, receiver) = channel::unbounded::<Message>();
             links.push(Link {
                 sender: Some(sender),
                 receiver,
@@ -2165,7 +2159,7 @@ impl CsvRecorder {
 fn start_csv_recorder<E>(
     config: Option<CsvTelemetryConfig>,
     snapshot: Arc<RwLock<PiperSnapshot>>,
-    failure_sender: kanal::Sender<InternalFailure>,
+    failure_sender: channel::Sender<InternalFailure>,
     abort: Arc<AtomicBool>,
 ) -> Result<Option<CsvRecorder>, E>
 where
@@ -2371,14 +2365,14 @@ fn run_supervisor<E>(
     shutdown: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
     snapshot: Arc<RwLock<PiperSnapshot>>,
-    internal_failure_sender: kanal::Sender<InternalFailure>,
-    internal_failure_receiver: kanal::Receiver<InternalFailure>,
+    internal_failure_sender: channel::Sender<InternalFailure>,
+    internal_failure_receiver: channel::Receiver<InternalFailure>,
     mut csv_recorder: Option<CsvRecorder>,
 ) -> Result<(), E>
 where
     E: Debug + Display + Send + 'static,
 {
-    let (worker_event_sender, worker_event_receiver) = kanal::unbounded::<WorkerEvent<E>>();
+    let (worker_event_sender, worker_event_receiver) = channel::unbounded::<WorkerEvent<E>>();
     let mut workers = Vec::new();
     let mut active_by_stage = vec![Vec::<usize>::new(); stages.len()];
     let mut parked = Vec::new();
@@ -2460,7 +2454,7 @@ where
             &mut stored_failure,
         );
 
-        while let Ok(Some(failure)) = internal_failure_receiver.try_recv() {
+        while let Ok(failure) = internal_failure_receiver.try_recv() {
             stored_failure = Some(match failure {
                 InternalFailure::Internal { message } => PiperError::Internal {
                     worker: "piper-supervisor".to_string(),
@@ -2653,14 +2647,14 @@ where
 
 fn spawn_worker<E>(
     workers: &mut Vec<WorkerSlot<E>>,
-    event_sender: kanal::Sender<WorkerEvent<E>>,
+    event_sender: channel::Sender<WorkerEvent<E>>,
     name: &str,
 ) -> Result<usize, E>
 where
     E: Debug + Display + Send + 'static,
 {
     let worker_id = workers.len();
-    let (command_sender, command_receiver) = kanal::unbounded::<WorkerCommand<E>>();
+    let (command_sender, command_receiver) = channel::unbounded::<WorkerCommand<E>>();
     let thread_name = name.to_string();
     let worker_thread_name = thread_name.clone();
     let handle = thread::Builder::new()
@@ -2713,7 +2707,7 @@ fn assign_worker<E>(
     input_link: usize,
     shutdown: &Arc<AtomicBool>,
     abort: &Arc<AtomicBool>,
-    internal_failure: &kanal::Sender<InternalFailure>,
+    internal_failure: &channel::Sender<InternalFailure>,
     workers: &mut [WorkerSlot<E>],
     active_by_stage: &mut [Vec<usize>],
 ) -> Result<(), E>
@@ -2766,8 +2760,8 @@ where
 fn worker_loop<E>(
     worker_id: usize,
     worker_name: String,
-    command_receiver: kanal::Receiver<WorkerCommand<E>>,
-    event_sender: kanal::Sender<WorkerEvent<E>>,
+    command_receiver: channel::Receiver<WorkerCommand<E>>,
+    event_sender: channel::Sender<WorkerEvent<E>>,
 ) where
     E: Debug + Display + Send + 'static,
 {
@@ -2786,7 +2780,7 @@ fn run_assignment<E>(
     worker_id: usize,
     worker_name: &str,
     assignment: WorkerAssignment<E>,
-    event_sender: &kanal::Sender<WorkerEvent<E>>,
+    event_sender: &channel::Sender<WorkerEvent<E>>,
 ) where
     E: Debug + Display + Send + 'static,
 {
@@ -2862,7 +2856,7 @@ fn run_assignment<E>(
                     .processed_items
                     .fetch_add(1, Ordering::Relaxed);
             }
-            Err(kanal::ReceiveErrorTimeout::Timeout) => {
+            Err(channel::RecvTimeoutError::Timeout) => {
                 assignment.stats.wait_nanos.fetch_add(
                     duration_nanos_u64(wait_started.elapsed()),
                     Ordering::Relaxed,
@@ -2871,8 +2865,7 @@ fn run_assignment<E>(
                     break;
                 }
             }
-            Err(kanal::ReceiveErrorTimeout::Closed)
-            | Err(kanal::ReceiveErrorTimeout::SendClosed) => {
+            Err(channel::RecvTimeoutError::Closed) => {
                 assignment.stats.wait_nanos.fetch_add(
                     duration_nanos_u64(wait_started.elapsed()),
                     Ordering::Relaxed,
@@ -2902,7 +2895,7 @@ fn run_assignment<E>(
 
 #[allow(clippy::too_many_arguments)]
 fn drain_worker_events<E>(
-    receiver: &kanal::Receiver<WorkerEvent<E>>,
+    receiver: &channel::Receiver<WorkerEvent<E>>,
     workers: &mut [WorkerSlot<E>],
     active_by_stage: &mut [Vec<usize>],
     parked: &mut Vec<usize>,
@@ -2913,7 +2906,7 @@ fn drain_worker_events<E>(
 ) where
     E: Debug + Display + Send + 'static,
 {
-    while let Ok(Some(event)) = receiver.try_recv() {
+    while let Ok(event) = receiver.try_recv() {
         match event {
             WorkerEvent::Started { worker_id, .. } => {
                 if pending_scale.as_ref().is_some_and(|pending| {
@@ -3969,7 +3962,7 @@ mod tests {
 
     #[test]
     fn link_sampling_tracks_rates_and_numeric_trends() {
-        let (sender, receiver) = kanal::unbounded::<Message>();
+        let (sender, receiver) = channel::unbounded::<Message>();
         let links = vec![Link {
             sender: Some(sender.clone()),
             receiver,
@@ -4194,8 +4187,8 @@ mod tests {
 
     #[test]
     fn lease_returns_recycled_value_on_drop() {
-        let (recycle_sender, recycle_receiver) = kanal::unbounded();
-        let (failure_sender, _failure_receiver) = kanal::unbounded();
+        let (recycle_sender, recycle_receiver) = channel::unbounded();
+        let (failure_sender, _failure_receiver) = channel::unbounded();
         let runtime = LeaseRuntime {
             shutdown: Arc::new(AtomicBool::new(false)),
             abort: Arc::new(AtomicBool::new(false)),
@@ -4214,9 +4207,9 @@ mod tests {
 
     #[test]
     fn lease_recycle_failure_is_fatal_outside_shutdown() {
-        let (recycle_sender, recycle_receiver) = kanal::unbounded();
+        let (recycle_sender, recycle_receiver) = channel::unbounded();
         drop(recycle_receiver);
-        let (failure_sender, failure_receiver) = kanal::unbounded();
+        let (failure_sender, failure_receiver) = channel::unbounded();
         let abort = Arc::new(AtomicBool::new(false));
         let runtime = LeaseRuntime {
             shutdown: Arc::new(AtomicBool::new(false)),
