@@ -3,7 +3,11 @@ compile_error!("enable `channel-kanal` or `channel-crossbeam`");
 
 use parking_lot::RwLock;
 use std::any::Any;
+#[cfg(feature = "feeder")]
+use std::collections::HashMap;
 use std::fmt::{Debug, Display};
+#[cfg(feature = "feeder")]
+use std::num::NonZeroUsize;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::marker::PhantomData;
@@ -740,7 +744,7 @@ where
     Out: Send + 'static,
     E: Debug + Display + Send + 'static,
 {
-    output: channel::Sender<Message>,
+    output: OutputHandle,
     output_stats: Arc<LinkStats>,
     output_acquire: Option<Arc<AcquireFn<Out>>>,
     shutdown: Arc<AtomicBool>,
@@ -755,7 +759,7 @@ where
     E: Debug + Display + Send + 'static,
 {
     pub fn emit(&mut self, output: Out) {
-        match self.output.send(Box::new(output)) {
+        match self.output.send(Box::new(output) as Message) {
             Ok(()) => {
                 self.output_stats.arrivals.fetch_add(1, Ordering::Relaxed);
             }
@@ -825,7 +829,7 @@ where
 }
 
 struct RuntimeStageContext {
-    output: channel::Sender<Message>,
+    output: OutputHandle,
     output_stats: Arc<LinkStats>,
     output_acquire: Option<DynAcquire>,
     shutdown: Arc<AtomicBool>,
@@ -1325,16 +1329,260 @@ impl UntypedExternalNode {
     }
 }
 
+#[cfg(feature = "feeder")]
+#[derive(Debug, Clone)]
+pub struct FeederLinkConfig {
+    pub scheduler_threads: NonZeroUsize,
+    pub water_low: NonZeroUsize,
+    pub water_high: NonZeroUsize,
+}
+
+#[cfg(feature = "feeder")]
+impl FeederLinkConfig {
+    pub fn new(
+        scheduler_threads: NonZeroUsize,
+        water_low: NonZeroUsize,
+        water_high: NonZeroUsize,
+    ) -> Self {
+        Self {
+            scheduler_threads,
+            water_low,
+            water_high,
+        }
+    }
+}
+
+#[cfg(feature = "feeder")]
+impl Default for FeederLinkConfig {
+    fn default() -> Self {
+        Self {
+            scheduler_threads: NonZeroUsize::new(4).unwrap(),
+            water_low: NonZeroUsize::new(16).unwrap(),
+            water_high: NonZeroUsize::new(64).unwrap(),
+        }
+    }
+}
+
+enum RecvPoll {
+    Item(Message),
+    Timeout,
+    Disconnected,
+}
+
+#[derive(Clone)]
+enum OutputHandle {
+    Standard(channel::Sender<Message>),
+    #[cfg(feature = "feeder")]
+    Feeder(feeder::FeederTx<Message>),
+}
+
+impl OutputHandle {
+    fn send(&self, message: Message) -> std::result::Result<(), ()> {
+        match self {
+            OutputHandle::Standard(sender) => sender.send(message).map_err(|_| ()),
+            #[cfg(feature = "feeder")]
+            OutputHandle::Feeder(tx) => tx.send(message).map_err(|_| ()),
+        }
+    }
+}
+
+#[cfg(feature = "feeder")]
+struct FeederInput {
+    rx: feeder::FeederRx<Message>,
+    terminated: AtomicBool,
+}
+
+enum InputHandle {
+    Standard(channel::Receiver<Message>),
+    #[cfg(feature = "feeder")]
+    Feeder(FeederInput),
+}
+
+impl InputHandle {
+    fn recv_poll(&self, timeout: Duration) -> RecvPoll {
+        match self {
+            InputHandle::Standard(receiver) => match receiver.recv_timeout(timeout) {
+                Ok(message) => RecvPoll::Item(message),
+                Err(channel::RecvTimeoutError::Timeout) => RecvPoll::Timeout,
+                Err(channel::RecvTimeoutError::Closed) => RecvPoll::Disconnected,
+            },
+            #[cfg(feature = "feeder")]
+            InputHandle::Feeder(input) => {
+                if input.terminated.load(Ordering::Acquire) {
+                    return RecvPoll::Disconnected;
+                }
+                match input.rx.try_get_one() {
+                    feeder::TryGetOne::Item(item) => RecvPoll::Item(item),
+                    feeder::TryGetOne::Empty => {
+                        thread::sleep(timeout);
+                        RecvPoll::Timeout
+                    }
+                    feeder::TryGetOne::InShutdown
+                    | feeder::TryGetOne::NoMoreWork
+                    | feeder::TryGetOne::Cancelled => {
+                        input.terminated.store(true, Ordering::Release);
+                        RecvPoll::Disconnected
+                    }
+                }
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            InputHandle::Standard(receiver) => receiver.is_empty(),
+            #[cfg(feature = "feeder")]
+            InputHandle::Feeder(_) => false,
+        }
+    }
+
+    fn is_terminated(&self) -> bool {
+        match self {
+            InputHandle::Standard(receiver) => receiver.is_terminated(),
+            #[cfg(feature = "feeder")]
+            InputHandle::Feeder(input) => input.terminated.load(Ordering::Acquire),
+        }
+    }
+}
+
+enum LinkKind {
+    Standard {
+        sender: Option<channel::Sender<Message>>,
+        receiver: channel::Receiver<Message>,
+    },
+    #[cfg(feature = "feeder")]
+    Feeder {
+        feeder: feeder::Feeder<Message>,
+        low: NonZeroUsize,
+        high: NonZeroUsize,
+    },
+}
+
 struct Link {
-    sender: Option<channel::Sender<Message>>,
-    receiver: channel::Receiver<Message>,
     stats: Arc<LinkStats>,
+    kind: LinkKind,
+}
+
+impl Link {
+    fn standard_sender(&self) -> &channel::Sender<Message> {
+        match &self.kind {
+            LinkKind::Standard { sender, .. } => sender
+                .as_ref()
+                .expect("standard link sender exists"),
+            #[cfg(feature = "feeder")]
+            LinkKind::Feeder { .. } => panic!("feeder link has no standard sender"),
+        }
+    }
+
+    fn standard_receiver(&self) -> &channel::Receiver<Message> {
+        match &self.kind {
+            LinkKind::Standard { receiver, .. } => receiver,
+            #[cfg(feature = "feeder")]
+            LinkKind::Feeder { .. } => panic!("feeder link has no standard receiver"),
+        }
+    }
+
+    fn make_output(&self) -> OutputHandle {
+        match &self.kind {
+            LinkKind::Standard { sender, .. } => {
+                OutputHandle::Standard(sender.as_ref().expect("standard sender exists").clone())
+            }
+            #[cfg(feature = "feeder")]
+            LinkKind::Feeder { feeder, .. } => OutputHandle::Feeder(
+                feeder
+                    .tx()
+                    .expect("feeder producer handle unavailable"),
+            ),
+        }
+    }
+
+    fn make_input(&self) -> InputHandle {
+        match &self.kind {
+            LinkKind::Standard { receiver, .. } => InputHandle::Standard(receiver.clone()),
+            #[cfg(feature = "feeder")]
+            LinkKind::Feeder { feeder, low, high, .. } => InputHandle::Feeder(FeederInput {
+                rx: feeder
+                    .rx(*low, *high)
+                    .expect("feeder consumer handle unavailable"),
+                terminated: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    fn close(&mut self) {
+        match &mut self.kind {
+            LinkKind::Standard { sender, .. } => {
+                sender.take();
+            }
+            #[cfg(feature = "feeder")]
+            LinkKind::Feeder { feeder, .. } => {
+                feeder.graceful_shutdown();
+            }
+        }
+    }
+
+    fn abort(&mut self) {
+        match &mut self.kind {
+            LinkKind::Standard { sender, .. } => {
+                sender.take();
+            }
+            #[cfg(feature = "feeder")]
+            LinkKind::Feeder { feeder, .. } => {
+                feeder.cancel();
+            }
+        }
+    }
+
+    fn queue_len(&self) -> Option<usize> {
+        match &self.kind {
+            LinkKind::Standard { receiver, .. } => Some(receiver.len()),
+            #[cfg(feature = "feeder")]
+            LinkKind::Feeder { .. } => None,
+        }
+    }
 }
 
 #[derive(Default)]
 struct LinkStats {
     arrivals: AtomicU64,
     drains: AtomicU64,
+}
+
+#[cfg(feature = "feeder")]
+fn validate_feeder_links<E>(
+    feeder_links: &HashMap<usize, FeederLinkConfig>,
+    input_link: usize,
+    output_link: usize,
+    stages: &[GraphStageSpec<E>],
+) -> Result<(), E>
+where
+    E: Debug + Display + Send + 'static,
+{
+    for &index in feeder_links.keys() {
+        if index == input_link {
+            return Err(PiperError::InvalidGraph {
+                message: "pipeline input link cannot use feeder".to_string(),
+            });
+        }
+        if index == output_link {
+            return Err(PiperError::InvalidGraph {
+                message: "pipeline output link cannot use feeder".to_string(),
+            });
+        }
+        for stage in stages {
+            if stage.external_index.is_some()
+                && (stage.input_link == index || stage.output_link == index)
+            {
+                return Err(PiperError::InvalidGraph {
+                    message: format!(
+                        "external node `{}` cannot use feeder on its input or output link",
+                        stage.name
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 pub struct GraphLink<T>
@@ -1376,6 +1624,8 @@ where
     link_count: usize,
     stages: Vec<GraphStageSpec<E>>,
     external_count: usize,
+    #[cfg(feature = "feeder")]
+    feeder_links: HashMap<usize, FeederLinkConfig>,
     _marker: PhantomData<fn(In) -> Out>,
 }
 
@@ -1387,6 +1637,8 @@ where
     link_count: usize,
     stages: Vec<GraphStageSpec<E>>,
     external_count: usize,
+    #[cfg(feature = "feeder")]
+    feeder_links: HashMap<usize, FeederLinkConfig>,
     _marker: PhantomData<fn(In)>,
 }
 
@@ -1400,6 +1652,8 @@ where
             link_count: 1,
             stages: Vec::new(),
             external_count: 0,
+            #[cfg(feature = "feeder")]
+            feeder_links: HashMap::new(),
             _marker: PhantomData,
         }
     }
@@ -1497,6 +1751,14 @@ where
         token
     }
 
+    #[cfg(feature = "feeder")]
+    pub fn feeder_link<T>(&mut self, link: GraphLink<T>, config: FeederLinkConfig)
+    where
+        T: Send + 'static,
+    {
+        self.feeder_links.insert(link.index(), config);
+    }
+
     pub fn finish<Out>(self, output: GraphLink<Out>) -> PipelineGraph<In, Out, E>
     where
         Out: Send + 'static,
@@ -1507,6 +1769,8 @@ where
             link_count: self.link_count.max(output.index + 1),
             stages: self.stages,
             external_count: self.external_count,
+            #[cfg(feature = "feeder")]
+            feeder_links: self.feeder_links,
             _marker: PhantomData,
         }
     }
@@ -1570,9 +1834,9 @@ where
 {
     stage_index: usize,
     stage: Arc<dyn DynStage<E>>,
-    input: channel::Receiver<Message>,
+    input: InputHandle,
     input_stats: Arc<LinkStats>,
-    output: channel::Sender<Message>,
+    output: OutputHandle,
     output_stats: Arc<LinkStats>,
     output_acquire: Option<DynAcquire>,
     is_input_stage: bool,
@@ -1874,6 +2138,8 @@ where
             link_count,
             stages,
             external_count,
+            #[cfg(feature = "feeder")]
+            feeder_links,
             ..
         } = graph;
 
@@ -1892,6 +2158,9 @@ where
         }
         validate_graph_is_acyclic(&stages)?;
 
+        #[cfg(feature = "feeder")]
+        validate_feeder_links(&feeder_links, input_link, output_link, &stages)?;
+
         let anchor_count = stages.iter().filter(|stage| stage.anchor.is_some()).count();
         if anchor_count == 0 && config.global_worker_cap == Some(0) {
             return Err(PiperError::InvalidGraph {
@@ -1909,21 +2178,41 @@ where
         };
 
         let mut links = Vec::with_capacity(link_count);
-        for _ in 0..link_count {
-            let (sender, receiver) = channel::unbounded::<Message>();
+        for link_index in 0..link_count {
+            #[cfg(feature = "feeder")]
+            let kind = if let Some(cfg) = feeder_links.get(&link_index) {
+                let feeder = feeder::Feeder::<Message>::builder()
+                    .scheduler_threads(cfg.scheduler_threads)
+                    .build();
+                LinkKind::Feeder {
+                    feeder,
+                    low: cfg.water_low,
+                    high: cfg.water_high,
+                }
+            } else {
+                let (sender, receiver) = channel::unbounded::<Message>();
+                LinkKind::Standard {
+                    sender: Some(sender),
+                    receiver,
+                }
+            };
+            #[cfg(not(feature = "feeder"))]
+            let kind = {
+                let _ = link_index;
+                let (sender, receiver) = channel::unbounded::<Message>();
+                LinkKind::Standard {
+                    sender: Some(sender),
+                    receiver,
+                }
+            };
             links.push(Link {
-                sender: Some(sender),
-                receiver,
                 stats: Arc::new(LinkStats::default()),
+                kind,
             });
         }
 
-        let input_sender = links[input_link]
-            .sender
-            .as_ref()
-            .expect("input sender exists")
-            .clone();
-        let output_receiver = links[output_link].receiver.clone();
+        let input_sender = links[input_link].standard_sender().clone();
+        let output_receiver = links[output_link].standard_receiver().clone();
         let input_stats = Arc::clone(&links[input_link].stats);
         let output_stats = Arc::clone(&links[output_link].stats);
 
@@ -1931,14 +2220,10 @@ where
             (0..external_count).map(|_| None).collect();
         for stage in &stages {
             if let Some(external_index) = stage.external_index {
-                let output = links[stage.output_link]
-                    .sender
-                    .as_ref()
-                    .expect("external output sender exists")
-                    .clone();
+                let output = links[stage.output_link].standard_sender().clone();
                 external_nodes[external_index] = Some(UntypedExternalNode {
                     name: stage.name.clone(),
-                    input: links[stage.input_link].receiver.clone(),
+                    input: links[stage.input_link].standard_receiver().clone(),
                     input_stats: Arc::clone(&links[stage.input_link].stats),
                     output,
                     output_stats: Arc::clone(&links[stage.output_link].stats),
@@ -2480,8 +2765,13 @@ where
             || stored_failure.is_some()
         {
             if supervisor_holds_links {
+                let aborting = abort.load(Ordering::Acquire) || stored_failure.is_some();
                 for link in &mut links {
-                    link.sender.take();
+                    if aborting {
+                        link.abort();
+                    } else {
+                        link.close();
+                    }
                 }
                 supervisor_holds_links = false;
             }
@@ -2721,18 +3011,11 @@ where
         worker: workers[worker_id].name.clone(),
         message: "cannot assign a managed worker to an external node".to_string(),
     })?;
-    let output = links[stage.output_link]
-        .sender
-        .as_ref()
-        .ok_or_else(|| PiperError::Internal {
-            worker: workers[worker_id].name.clone(),
-            message: "cannot assign worker after output sender was dropped".to_string(),
-        })?
-        .clone();
+    let output = links[stage.output_link].make_output();
     let assignment = WorkerAssignment {
         stage_index,
         stage: Arc::clone(stage_impl),
-        input: links[stage.input_link].receiver.clone(),
+        input: links[stage.input_link].make_input(),
         input_stats: Arc::clone(&links[stage.input_link].stats),
         output,
         output_stats: Arc::clone(&links[stage.output_link].stats),
@@ -2818,8 +3101,8 @@ fn run_assignment<E>(
         }
 
         let wait_started = Instant::now();
-        match assignment.input.recv_timeout(assignment.poll_interval) {
-            Ok(input) => {
+        match assignment.input.recv_poll(assignment.poll_interval) {
+            RecvPoll::Item(input) => {
                 assignment.stats.wait_nanos.fetch_add(
                     duration_nanos_u64(wait_started.elapsed()),
                     Ordering::Relaxed,
@@ -2856,7 +3139,7 @@ fn run_assignment<E>(
                     .processed_items
                     .fetch_add(1, Ordering::Relaxed);
             }
-            Err(channel::RecvTimeoutError::Timeout) => {
+            RecvPoll::Timeout => {
                 assignment.stats.wait_nanos.fetch_add(
                     duration_nanos_u64(wait_started.elapsed()),
                     Ordering::Relaxed,
@@ -2865,7 +3148,7 @@ fn run_assignment<E>(
                     break;
                 }
             }
-            Err(channel::RecvTimeoutError::Closed) => {
+            RecvPoll::Disconnected => {
                 assignment.stats.wait_nanos.fetch_add(
                     duration_nanos_u64(wait_started.elapsed()),
                     Ordering::Relaxed,
@@ -3059,7 +3342,7 @@ fn sample_links(links: &[Link], elapsed: Duration, controls: &mut [LinkControl])
         let drains = link.stats.drains.load(Ordering::Relaxed);
         let delta_arrivals = arrivals.saturating_sub(controls[index].last_arrivals);
         let delta_drains = drains.saturating_sub(controls[index].last_drains);
-        let len = link.receiver.len();
+        let len = link.queue_len().unwrap_or(0);
         let previous_len = controls[index].len;
         let arrival_rate = delta_arrivals as f64 / seconds;
         let drain_rate = delta_drains as f64 / seconds;
@@ -3748,7 +4031,7 @@ fn update_snapshot<E>(
         .enumerate()
         .map(|(index, control)| LinkSnapshot {
             index,
-            len: links[index].receiver.len(),
+            len: links[index].queue_len().unwrap_or(0),
             trend: control.trend,
             arrival_rate: control.arrival_rate,
             drain_rate: control.drain_rate,
@@ -3964,9 +4247,11 @@ mod tests {
     fn link_sampling_tracks_rates_and_numeric_trends() {
         let (sender, receiver) = channel::unbounded::<Message>();
         let links = vec![Link {
-            sender: Some(sender.clone()),
-            receiver,
             stats: Arc::new(LinkStats::default()),
+            kind: LinkKind::Standard {
+                sender: Some(sender.clone()),
+                receiver,
+            },
         }];
         let mut controls = vec![LinkControl::default()];
 

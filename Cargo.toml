@@ -10,15 +10,25 @@ edition = "2024"
 default = ["channel-crossbeam"]
 channel-kanal = ["dep:kanal"]
 channel-crossbeam = ["dep:crossbeam-channel"]
+feeder = ["dep:feeder"]
 
 [dependencies]
 anyhow = "1.0.102"
+feeder = { git = "https://github.com/alexipeck/feeder.git", optional = true }
 kanal = { version = "0.1.1", optional = true }
 crossbeam-channel = { version = "0.5.15", optional = true }
 parking_lot = "0.12.5"
 piper-macros = { path = "piper-macros" }
 rand = "0.10.1"
 thiserror = "2.0.18"
+
+[[example]]
+name = "fork_join_feeder"
+required-features = ["feeder"]
+
+[[example]]
+name = "scaling_pipeline_feeder"
+required-features = ["feeder"]
 
 [dev-dependencies]
 trybuild = "1.0.116"
