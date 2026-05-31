@@ -77,6 +77,10 @@ cargo run --release --example fork_join_pipeline
 
 See [examples/fork_join_pipeline.rs](examples/fork_join_pipeline.rs) for `Stage` implementations, buffer leases, telemetry, and concurrent output draining. For linear `stages = [ ... ]` sugar without a graph, see [examples/pipeline_api_styles.rs](examples/pipeline_api_styles.rs).
 
+## Feeder MPMC links
+
+With the `feeder` feature enabled, `PipelineGraphBuilder::feeder_link(...)` can mark any graph link as a feeder-backed MPMC queue, including links adjacent to external nodes and the public pipeline `input` / `output` endpoints. See [examples/scaling_pipeline_feeder.rs](examples/scaling_pipeline_feeder.rs) and [examples/fork_join_feeder.rs](examples/fork_join_feeder.rs).
+
 ## External node pipeline
 
 Use `external_node(Input, Output)` when Piper should own the graph, channels, telemetry, cancellation, and shutdown while user code owns the worker loop. The runnable example in [examples/external_node_pipeline.rs](examples/external_node_pipeline.rs) forks prepared batches to one managed hash branch and one external hash branch, then joins both branches back into a managed normalize stage.

@@ -428,9 +428,9 @@ where
     E: Debug + Display + Send + 'static,
 {
     name: String,
-    input: channel::Receiver<Message>,
+    input: LinkReceiver,
     input_stats: Arc<LinkStats>,
-    output: channel::Sender<Message>,
+    output: LinkSender,
     output_stats: Arc<LinkStats>,
     shutdown: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
@@ -447,7 +447,7 @@ where
     fn clone(&self) -> Self {
         Self {
             name: self.name.clone(),
-            input: self.input.clone(),
+            input: self.input.clone_for_external(),
             input_stats: Arc::clone(&self.input_stats),
             output: self.output.clone(),
             output_stats: Arc::clone(&self.output_stats),
@@ -479,8 +479,8 @@ where
             .input
             .recv_timeout(duration)
             .map_err(|error| match error {
-                channel::RecvTimeoutError::Timeout => RecvOutputError::Timeout,
-                channel::RecvTimeoutError::Closed => RecvOutputError::Closed,
+                LinkRecvError::Timeout => RecvOutputError::Timeout,
+                LinkRecvError::Closed => RecvOutputError::Closed,
             })?;
         self.input_stats.drains.fetch_add(1, Ordering::Relaxed);
         input
@@ -492,8 +492,8 @@ where
     pub fn try_recv(&self) -> std::result::Result<In, TryRecvOutputError> {
         let input = match self.input.try_recv() {
             Ok(input) => input,
-            Err(channel::TryRecvError::Empty) => return Err(TryRecvOutputError::Empty),
-            Err(channel::TryRecvError::Closed) => return Err(TryRecvOutputError::Closed),
+            Err(LinkTryRecvError::Empty) => return Err(TryRecvOutputError::Empty),
+            Err(LinkTryRecvError::Closed) => return Err(TryRecvOutputError::Closed),
         };
         self.input_stats.drains.fetch_add(1, Ordering::Relaxed);
         input
@@ -544,7 +544,7 @@ where
 }
 
 pub struct PiperSender<In> {
-    inner: channel::Sender<Message>,
+    inner: LinkSender,
     stats: Arc<LinkStats>,
     shutdown: Arc<AtomicBool>,
     _marker: PhantomData<fn(In)>,
@@ -582,7 +582,7 @@ where
 }
 
 pub struct PiperReceiver<Out> {
-    inner: channel::Receiver<Message>,
+    inner: LinkReceiver,
     stats: Arc<LinkStats>,
     _marker: PhantomData<fn() -> Out>,
 }
@@ -615,8 +615,8 @@ where
             .inner
             .recv_timeout(duration)
             .map_err(|error| match error {
-                channel::RecvTimeoutError::Timeout => RecvOutputError::Timeout,
-                channel::RecvTimeoutError::Closed => RecvOutputError::Closed,
+                LinkRecvError::Timeout => RecvOutputError::Timeout,
+                LinkRecvError::Closed => RecvOutputError::Closed,
             })?;
         self.stats.drains.fetch_add(1, Ordering::Relaxed);
         output
@@ -628,8 +628,8 @@ where
     pub fn try_recv(&self) -> std::result::Result<Out, TryRecvOutputError> {
         let output = match self.inner.try_recv() {
             Ok(output) => output,
-            Err(channel::TryRecvError::Empty) => return Err(TryRecvOutputError::Empty),
-            Err(channel::TryRecvError::Closed) => return Err(TryRecvOutputError::Closed),
+            Err(LinkTryRecvError::Empty) => return Err(TryRecvOutputError::Empty),
+            Err(LinkTryRecvError::Closed) => return Err(TryRecvOutputError::Closed),
         };
         self.stats.drains.fetch_add(1, Ordering::Relaxed);
         output
@@ -744,7 +744,7 @@ where
     Out: Send + 'static,
     E: Debug + Display + Send + 'static,
 {
-    output: OutputHandle,
+    output: LinkSender,
     output_stats: Arc<LinkStats>,
     output_acquire: Option<Arc<AcquireFn<Out>>>,
     shutdown: Arc<AtomicBool>,
@@ -829,7 +829,7 @@ where
 }
 
 struct RuntimeStageContext {
-    output: OutputHandle,
+    output: LinkSender,
     output_stats: Arc<LinkStats>,
     output_acquire: Option<DynAcquire>,
     shutdown: Arc<AtomicBool>,
@@ -1299,9 +1299,9 @@ impl InternalFailure {
 
 struct UntypedExternalNode {
     name: String,
-    input: channel::Receiver<Message>,
+    input: LinkReceiver,
     input_stats: Arc<LinkStats>,
-    output: channel::Sender<Message>,
+    output: LinkSender,
     output_stats: Arc<LinkStats>,
     shutdown: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
@@ -1369,78 +1369,253 @@ enum RecvPoll {
     Disconnected,
 }
 
+enum LinkRecvError {
+    Timeout,
+    Closed,
+}
+
+enum LinkTryRecvError {
+    Empty,
+    Closed,
+}
+
 #[derive(Clone)]
-enum OutputHandle {
+struct LinkSender {
+    inner: LinkSenderInner,
+}
+
+#[derive(Clone)]
+enum LinkSenderInner {
     Standard(channel::Sender<Message>),
     #[cfg(feature = "feeder")]
     Feeder(feeder::FeederTx<Message>),
 }
 
-impl OutputHandle {
+impl LinkSender {
     fn send(&self, message: Message) -> std::result::Result<(), ()> {
-        match self {
-            OutputHandle::Standard(sender) => sender.send(message).map_err(|_| ()),
+        match &self.inner {
+            LinkSenderInner::Standard(sender) => sender.send(message).map_err(|_| ()),
             #[cfg(feature = "feeder")]
-            OutputHandle::Feeder(tx) => tx.send(message).map_err(|_| ()),
+            LinkSenderInner::Feeder(tx) => tx.send(message).map_err(|_| ()),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        match &self.inner {
+            LinkSenderInner::Standard(sender) => sender.is_closed(),
+            #[cfg(feature = "feeder")]
+            LinkSenderInner::Feeder(_) => false,
         }
     }
 }
 
 #[cfg(feature = "feeder")]
-struct FeederInput {
-    rx: feeder::FeederRx<Message>,
-    terminated: AtomicBool,
+struct FeederLinkReceiver {
+    feeder: Arc<feeder::Feeder<Message>>,
+    low: NonZeroUsize,
+    high: NonZeroUsize,
+    rx: Arc<feeder::FeederRx<Message>>,
+    closed: Arc<AtomicBool>,
 }
 
-enum InputHandle {
-    Standard(channel::Receiver<Message>),
-    #[cfg(feature = "feeder")]
-    Feeder(FeederInput),
+#[cfg(feature = "feeder")]
+impl FeederLinkReceiver {
+    fn new(feeder: Arc<feeder::Feeder<Message>>, low: NonZeroUsize, high: NonZeroUsize) -> Self {
+        let rx = feeder
+            .rx(low, high)
+            .expect("feeder consumer handle unavailable");
+        Self {
+            feeder,
+            low,
+            high,
+            rx: Arc::new(rx),
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn fork(&self) -> Self {
+        Self::new(Arc::clone(&self.feeder), self.low, self.high)
+    }
+
+    fn clone_shared(&self) -> Self {
+        Self {
+            feeder: Arc::clone(&self.feeder),
+            low: self.low,
+            high: self.high,
+            rx: Arc::clone(&self.rx),
+            closed: Arc::clone(&self.closed),
+        }
+    }
+
+    fn mark_closed(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn poll_try_get_one(&self) -> feeder::TryGetOne<Message> {
+        let result = self.rx.try_get_one();
+        if matches!(
+            result,
+            feeder::TryGetOne::NoMoreWork | feeder::TryGetOne::Cancelled
+        ) {
+            self.mark_closed();
+        }
+        result
+    }
 }
 
-impl InputHandle {
-    fn recv_poll(&self, timeout: Duration) -> RecvPoll {
-        match self {
-            InputHandle::Standard(receiver) => match receiver.recv_timeout(timeout) {
-                Ok(message) => RecvPoll::Item(message),
-                Err(channel::RecvTimeoutError::Timeout) => RecvPoll::Timeout,
-                Err(channel::RecvTimeoutError::Closed) => RecvPoll::Disconnected,
+struct LinkReceiver {
+    inner: LinkReceiverInner,
+}
+
+impl Clone for LinkReceiver {
+    fn clone(&self) -> Self {
+        match &self.inner {
+            LinkReceiverInner::Standard(receiver) => LinkReceiver {
+                inner: LinkReceiverInner::Standard(receiver.clone()),
             },
             #[cfg(feature = "feeder")]
-            InputHandle::Feeder(input) => {
-                if input.terminated.load(Ordering::Acquire) {
-                    return RecvPoll::Disconnected;
+            LinkReceiverInner::Feeder(input) => LinkReceiver {
+                inner: LinkReceiverInner::Feeder(input.clone_shared()),
+            },
+        }
+    }
+}
+
+enum LinkReceiverInner {
+    Standard(channel::Receiver<Message>),
+    #[cfg(feature = "feeder")]
+    Feeder(FeederLinkReceiver),
+}
+
+impl LinkReceiver {
+    fn clone_for_external(&self) -> Self {
+        match &self.inner {
+            LinkReceiverInner::Standard(receiver) => LinkReceiver {
+                inner: LinkReceiverInner::Standard(receiver.clone()),
+            },
+            #[cfg(feature = "feeder")]
+            LinkReceiverInner::Feeder(input) => LinkReceiver {
+                inner: LinkReceiverInner::Feeder(input.fork()),
+            },
+        }
+    }
+
+    fn recv(&self) -> std::result::Result<Message, LinkRecvError> {
+        match &self.inner {
+            LinkReceiverInner::Standard(receiver) => {
+                receiver.recv().map_err(|_| LinkRecvError::Closed)
+            }
+            #[cfg(feature = "feeder")]
+            LinkReceiverInner::Feeder(input) => input
+                .rx
+                .get_one()
+                .map_err(|_| {
+                    input.mark_closed();
+                    LinkRecvError::Closed
+                }),
+        }
+    }
+
+    fn recv_timeout(&self, duration: Duration) -> std::result::Result<Message, LinkRecvError> {
+        match &self.inner {
+            LinkReceiverInner::Standard(receiver) => match receiver.recv_timeout(duration) {
+                Ok(message) => Ok(message),
+                Err(channel::RecvTimeoutError::Timeout) => Err(LinkRecvError::Timeout),
+                Err(channel::RecvTimeoutError::Closed) => Err(LinkRecvError::Closed),
+            },
+            #[cfg(feature = "feeder")]
+            LinkReceiverInner::Feeder(input) => {
+                if input.is_closed() {
+                    return Err(LinkRecvError::Closed);
                 }
-                match input.rx.try_get_one() {
-                    feeder::TryGetOne::Item(item) => RecvPoll::Item(item),
-                    feeder::TryGetOne::Empty => {
-                        thread::sleep(timeout);
-                        RecvPoll::Timeout
-                    }
-                    feeder::TryGetOne::InShutdown
-                    | feeder::TryGetOne::NoMoreWork
-                    | feeder::TryGetOne::Cancelled => {
-                        input.terminated.store(true, Ordering::Release);
-                        RecvPoll::Disconnected
+                let deadline = Instant::now() + duration;
+                loop {
+                    match input.poll_try_get_one() {
+                        feeder::TryGetOne::Item(item) => return Ok(item),
+                        feeder::TryGetOne::Empty | feeder::TryGetOne::InShutdown => {
+                            if Instant::now() >= deadline {
+                                return Err(LinkRecvError::Timeout);
+                            }
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            thread::sleep(Duration::from_millis(1).min(remaining));
+                        }
+                        feeder::TryGetOne::NoMoreWork | feeder::TryGetOne::Cancelled => {
+                            return Err(LinkRecvError::Closed);
+                        }
                     }
                 }
             }
         }
     }
 
-    fn is_empty(&self) -> bool {
-        match self {
-            InputHandle::Standard(receiver) => receiver.is_empty(),
+    fn try_recv(&self) -> std::result::Result<Message, LinkTryRecvError> {
+        match &self.inner {
+            LinkReceiverInner::Standard(receiver) => match receiver.try_recv() {
+                Ok(message) => Ok(message),
+                Err(channel::TryRecvError::Empty) => Err(LinkTryRecvError::Empty),
+                Err(channel::TryRecvError::Closed) => Err(LinkTryRecvError::Closed),
+            },
             #[cfg(feature = "feeder")]
-            InputHandle::Feeder(_) => false,
+            LinkReceiverInner::Feeder(input) => match input.poll_try_get_one() {
+                feeder::TryGetOne::Item(item) => Ok(item),
+                feeder::TryGetOne::Empty | feeder::TryGetOne::InShutdown => {
+                    Err(LinkTryRecvError::Empty)
+                }
+                feeder::TryGetOne::NoMoreWork | feeder::TryGetOne::Cancelled => {
+                    Err(LinkTryRecvError::Closed)
+                }
+            },
+        }
+    }
+
+    fn recv_poll(&self, timeout: Duration) -> RecvPoll {
+        #[cfg(feature = "feeder")]
+        if let LinkReceiverInner::Feeder(input) = &self.inner {
+            if input.is_closed() {
+                return RecvPoll::Disconnected;
+            }
+            let deadline = Instant::now() + timeout;
+            loop {
+                match input.poll_try_get_one() {
+                    feeder::TryGetOne::Item(item) => return RecvPoll::Item(item),
+                    feeder::TryGetOne::NoMoreWork | feeder::TryGetOne::Cancelled => {
+                        return RecvPoll::Disconnected;
+                    }
+                    feeder::TryGetOne::Empty | feeder::TryGetOne::InShutdown => {
+                        if Instant::now() >= deadline {
+                            return RecvPoll::Timeout;
+                        }
+                        thread::sleep(Duration::from_millis(1).min(
+                            deadline.saturating_duration_since(Instant::now()),
+                        ));
+                    }
+                }
+            }
+        }
+        match self.recv_timeout(timeout) {
+            Ok(message) => RecvPoll::Item(message),
+            Err(LinkRecvError::Timeout) => RecvPoll::Timeout,
+            Err(LinkRecvError::Closed) => RecvPoll::Disconnected,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match &self.inner {
+            LinkReceiverInner::Standard(receiver) => receiver.is_empty(),
+            #[cfg(feature = "feeder")]
+            LinkReceiverInner::Feeder(_) => false,
         }
     }
 
     fn is_terminated(&self) -> bool {
-        match self {
-            InputHandle::Standard(receiver) => receiver.is_terminated(),
+        match &self.inner {
+            LinkReceiverInner::Standard(receiver) => receiver.is_terminated(),
             #[cfg(feature = "feeder")]
-            InputHandle::Feeder(input) => input.terminated.load(Ordering::Acquire),
+            LinkReceiverInner::Feeder(input) => input.is_closed(),
         }
     }
 }
@@ -1452,7 +1627,7 @@ enum LinkKind {
     },
     #[cfg(feature = "feeder")]
     Feeder {
-        feeder: feeder::Feeder<Message>,
+        feeder: Arc<feeder::Feeder<Message>>,
         low: NonZeroUsize,
         high: NonZeroUsize,
     },
@@ -1464,48 +1639,42 @@ struct Link {
 }
 
 impl Link {
-    fn standard_sender(&self) -> &channel::Sender<Message> {
+    fn make_output(&self) -> LinkSender {
         match &self.kind {
-            LinkKind::Standard { sender, .. } => sender
-                .as_ref()
-                .expect("standard link sender exists"),
+            LinkKind::Standard { sender, .. } => LinkSender {
+                inner: LinkSenderInner::Standard(
+                    sender.as_ref().expect("standard sender exists").clone(),
+                ),
+            },
             #[cfg(feature = "feeder")]
-            LinkKind::Feeder { .. } => panic!("feeder link has no standard sender"),
+            LinkKind::Feeder { feeder, .. } => LinkSender {
+                inner: LinkSenderInner::Feeder(
+                    feeder
+                        .tx()
+                        .expect("feeder producer handle unavailable"),
+                ),
+            },
         }
     }
 
-    fn standard_receiver(&self) -> &channel::Receiver<Message> {
+    fn make_input(&self) -> LinkReceiver {
         match &self.kind {
-            LinkKind::Standard { receiver, .. } => receiver,
+            LinkKind::Standard { receiver, .. } => LinkReceiver {
+                inner: LinkReceiverInner::Standard(receiver.clone()),
+            },
             #[cfg(feature = "feeder")]
-            LinkKind::Feeder { .. } => panic!("feeder link has no standard receiver"),
-        }
-    }
-
-    fn make_output(&self) -> OutputHandle {
-        match &self.kind {
-            LinkKind::Standard { sender, .. } => {
-                OutputHandle::Standard(sender.as_ref().expect("standard sender exists").clone())
-            }
-            #[cfg(feature = "feeder")]
-            LinkKind::Feeder { feeder, .. } => OutputHandle::Feeder(
-                feeder
-                    .tx()
-                    .expect("feeder producer handle unavailable"),
-            ),
-        }
-    }
-
-    fn make_input(&self) -> InputHandle {
-        match &self.kind {
-            LinkKind::Standard { receiver, .. } => InputHandle::Standard(receiver.clone()),
-            #[cfg(feature = "feeder")]
-            LinkKind::Feeder { feeder, low, high, .. } => InputHandle::Feeder(FeederInput {
-                rx: feeder
-                    .rx(*low, *high)
-                    .expect("feeder consumer handle unavailable"),
-                terminated: AtomicBool::new(false),
-            }),
+            LinkKind::Feeder {
+                feeder,
+                low,
+                high,
+                ..
+            } => LinkReceiver {
+                inner: LinkReceiverInner::Feeder(FeederLinkReceiver::new(
+                    Arc::clone(feeder),
+                    *low,
+                    *high,
+                )),
+            },
         }
     }
 
@@ -1546,43 +1715,6 @@ impl Link {
 struct LinkStats {
     arrivals: AtomicU64,
     drains: AtomicU64,
-}
-
-#[cfg(feature = "feeder")]
-fn validate_feeder_links<E>(
-    feeder_links: &HashMap<usize, FeederLinkConfig>,
-    input_link: usize,
-    output_link: usize,
-    stages: &[GraphStageSpec<E>],
-) -> Result<(), E>
-where
-    E: Debug + Display + Send + 'static,
-{
-    for &index in feeder_links.keys() {
-        if index == input_link {
-            return Err(PiperError::InvalidGraph {
-                message: "pipeline input link cannot use feeder".to_string(),
-            });
-        }
-        if index == output_link {
-            return Err(PiperError::InvalidGraph {
-                message: "pipeline output link cannot use feeder".to_string(),
-            });
-        }
-        for stage in stages {
-            if stage.external_index.is_some()
-                && (stage.input_link == index || stage.output_link == index)
-            {
-                return Err(PiperError::InvalidGraph {
-                    message: format!(
-                        "external node `{}` cannot use feeder on its input or output link",
-                        stage.name
-                    ),
-                });
-            }
-        }
-    }
-    Ok(())
 }
 
 pub struct GraphLink<T>
@@ -1834,9 +1966,9 @@ where
 {
     stage_index: usize,
     stage: Arc<dyn DynStage<E>>,
-    input: InputHandle,
+    input: LinkReceiver,
     input_stats: Arc<LinkStats>,
-    output: OutputHandle,
+    output: LinkSender,
     output_stats: Arc<LinkStats>,
     output_acquire: Option<DynAcquire>,
     is_input_stage: bool,
@@ -2158,9 +2290,6 @@ where
         }
         validate_graph_is_acyclic(&stages)?;
 
-        #[cfg(feature = "feeder")]
-        validate_feeder_links(&feeder_links, input_link, output_link, &stages)?;
-
         let anchor_count = stages.iter().filter(|stage| stage.anchor.is_some()).count();
         if anchor_count == 0 && config.global_worker_cap == Some(0) {
             return Err(PiperError::InvalidGraph {
@@ -2185,7 +2314,7 @@ where
                     .scheduler_threads(cfg.scheduler_threads)
                     .build();
                 LinkKind::Feeder {
-                    feeder,
+                    feeder: Arc::new(feeder),
                     low: cfg.water_low,
                     high: cfg.water_high,
                 }
@@ -2211,8 +2340,8 @@ where
             });
         }
 
-        let input_sender = links[input_link].standard_sender().clone();
-        let output_receiver = links[output_link].standard_receiver().clone();
+        let input_sender = links[input_link].make_output();
+        let output_receiver = links[output_link].make_input();
         let input_stats = Arc::clone(&links[input_link].stats);
         let output_stats = Arc::clone(&links[output_link].stats);
 
@@ -2220,12 +2349,11 @@ where
             (0..external_count).map(|_| None).collect();
         for stage in &stages {
             if let Some(external_index) = stage.external_index {
-                let output = links[stage.output_link].standard_sender().clone();
                 external_nodes[external_index] = Some(UntypedExternalNode {
                     name: stage.name.clone(),
-                    input: links[stage.input_link].standard_receiver().clone(),
+                    input: links[stage.input_link].make_input(),
                     input_stats: Arc::clone(&links[stage.input_link].stats),
-                    output,
+                    output: links[stage.output_link].make_output(),
                     output_stats: Arc::clone(&links[stage.output_link].stats),
                     shutdown: Arc::clone(&shutdown),
                     abort: Arc::clone(&abort),
@@ -2328,6 +2456,7 @@ where
         let supervisor_snapshot = Arc::clone(&snapshot);
         let supervisor_shutdown = Arc::clone(&shutdown);
         let supervisor_abort = Arc::clone(&abort);
+        let (startup_ready_tx, startup_ready_rx) = channel::unbounded();
         let supervisor = thread::Builder::new()
             .name("piper-supervisor".to_string())
             .spawn(move || {
@@ -2343,12 +2472,22 @@ where
                     internal_failure_sender,
                     internal_failure_receiver,
                     csv_recorder,
+                    startup_ready_tx,
                 )
             })
             .map_err(|source| PiperError::SpawnFailed {
                 worker: "piper-supervisor".to_string(),
                 source,
             })?;
+        if startup_ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .is_err()
+        {
+            return Err(PiperError::Internal {
+                worker: "piper-supervisor".to_string(),
+                message: "initial workers were not ready before startup completed".to_string(),
+            });
+        }
 
         Ok(Piper {
             sender: PiperSender {
@@ -2653,6 +2792,7 @@ fn run_supervisor<E>(
     internal_failure_sender: channel::Sender<InternalFailure>,
     internal_failure_receiver: channel::Receiver<InternalFailure>,
     mut csv_recorder: Option<CsvRecorder>,
+    startup_ready_tx: channel::Sender<()>,
 ) -> Result<(), E>
 where
     E: Debug + Display + Send + 'static,
@@ -2711,6 +2851,8 @@ where
         let worker_id = spawn_worker(&mut workers, worker_event_sender.clone(), &name)?;
         parked.push(worker_id);
     }
+
+    let _ = startup_ready_tx.send(());
 
     update_snapshot(
         &snapshot,
@@ -3144,7 +3286,9 @@ fn run_assignment<E>(
                     duration_nanos_u64(wait_started.elapsed()),
                     Ordering::Relaxed,
                 );
-                if assignment.input.is_terminated() {
+                if assignment.shutdown.load(Ordering::Acquire)
+                    || assignment.input.is_terminated()
+                {
                     break;
                 }
             }

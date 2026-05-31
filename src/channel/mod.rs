@@ -175,9 +175,18 @@ mod backend {
         }
 
         pub fn recv_timeout(&self, duration: Duration) -> Result<T, RecvTimeoutError> {
+            if self.is_terminated() && self.is_empty() {
+                return Err(RecvTimeoutError::Closed);
+            }
             match self.inner.recv_timeout(duration) {
                 Ok(value) => Ok(value),
-                Err(ReceiveErrorTimeout::Timeout) => Err(RecvTimeoutError::Timeout),
+                Err(ReceiveErrorTimeout::Timeout) => {
+                    if self.is_terminated() && self.is_empty() {
+                        Err(RecvTimeoutError::Closed)
+                    } else {
+                        Err(RecvTimeoutError::Timeout)
+                    }
+                }
                 Err(ReceiveErrorTimeout::Closed) | Err(ReceiveErrorTimeout::SendClosed) => {
                     Err(RecvTimeoutError::Closed)
                 }

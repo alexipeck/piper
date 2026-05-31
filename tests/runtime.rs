@@ -501,6 +501,204 @@ fn csv_telemetry_writes_wide_rows_and_existing_path_fails() {
     let _ = fs::remove_file(&path);
 }
 
+#[cfg(feature = "feeder")]
+mod feeder_tests {
+    use super::*;
+    use piper::{
+        FeederLinkConfig, RecvOutputError, TryRecvOutputError,
+    };
+    use std::num::NonZeroUsize;
+
+    fn feeder_config() -> FeederLinkConfig {
+        FeederLinkConfig::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+        )
+    }
+
+    fn feeder_test_config() -> PiperConfig {
+        PiperConfig {
+            sample_interval: Duration::from_millis(50),
+            poll_interval: Duration::from_millis(2),
+            global_worker_cap: Some(8),
+            csv_telemetry: None,
+        }
+    }
+
+    #[test]
+    fn feeder_boundary_input_external_output() {
+        let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
+        let input = builder.input();
+        let output = builder.link::<u32>();
+        let cfg = feeder_config();
+        builder.feeder_link(input, cfg.clone());
+        builder.feeder_link(output, cfg);
+        let external_token = builder.add_external_node_to::<u32, u32>(input, "external", output);
+        let mut piper =
+            Piper::<u32, u32, TestError>::start(feeder_test_config(), builder.finish(output)).unwrap();
+        let external = piper.take_external_node(external_token);
+
+        piper.sender().send(3).unwrap();
+        let value = external.recv_timeout(Duration::from_secs(1)).unwrap();
+        external.send(value + 1).unwrap();
+        assert_eq!(
+            piper
+                .receiver()
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            4
+        );
+        piper.shutdown();
+        drop(external);
+        piper.join().unwrap();
+    }
+
+    #[test]
+    fn feeder_external_input_clone_drains_concurrently() {
+        let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
+        let input = builder.input();
+        let output = builder.link::<u32>();
+        builder.feeder_link(input, feeder_config());
+        let external_token = builder.add_external_node_to::<u32, u32>(input, "external", output);
+        let mut piper =
+            Piper::<u32, u32, TestError>::start(feeder_test_config(), builder.finish(output)).unwrap();
+        let external_a = piper.take_external_node(external_token);
+        let external_b = external_a.clone();
+
+        const ITEMS: u32 = 16;
+        for value in 0..ITEMS {
+            piper.sender().send(value).unwrap();
+        }
+        piper.shutdown();
+
+        let worker = std::thread::spawn(move || {
+            loop {
+                match external_a.recv_timeout(Duration::from_secs(1)) {
+                    Ok(value) => {
+                        external_a.send(value + 100).unwrap();
+                    }
+                    Err(RecvOutputError::Closed) => break,
+                    Err(RecvOutputError::Timeout) => break,
+                    Err(error) => panic!("external recv failed: {error}"),
+                }
+            }
+        });
+
+        loop {
+            match external_b.recv_timeout(Duration::from_secs(1)) {
+                Ok(value) => {
+                    external_b.send(value + 100).unwrap();
+                }
+                Err(RecvOutputError::Closed) => break,
+                Err(RecvOutputError::Timeout) => break,
+                Err(error) => panic!("external recv failed: {error}"),
+            }
+        }
+        worker.join().unwrap();
+
+        let mut outputs = Vec::new();
+        let receiver = piper.receiver();
+        while outputs.len() < ITEMS as usize {
+            outputs.push(receiver.recv_timeout(Duration::from_secs(1)).unwrap());
+        }
+        outputs.sort_unstable();
+        let expected: Vec<u32> = (0..ITEMS).map(|value| value + 100).collect();
+        assert_eq!(outputs, expected);
+
+        piper.shutdown();
+        drop(external_b);
+        piper.join().unwrap();
+    }
+
+    #[test]
+    fn feeder_external_output_before_managed_stage() {
+        let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
+        let input = builder.input();
+        let external_out = builder.link::<u32>();
+        let output = builder.link::<u32>();
+        builder.feeder_link(external_out, feeder_config());
+        let external_token =
+            builder.add_external_node_to::<u32, u32>(input, "external", external_out);
+        builder.add_stage_to(
+            external_out,
+            anchor(stage("pass", Pass)).fixed_threads(1),
+            output,
+        );
+        let mut piper =
+            Piper::<u32, u32, TestError>::start(feeder_test_config(), builder.finish(output)).unwrap();
+        let external = piper.take_external_node(external_token);
+
+        piper.sender().send(5).unwrap();
+        let value = external.recv_timeout(Duration::from_secs(1)).unwrap();
+        external.send(value).unwrap();
+        assert_eq!(
+            piper
+                .receiver()
+                .recv_timeout(Duration::from_secs(1))
+                .expect("pipeline output"),
+            5
+        );
+        piper.shutdown();
+        drop(external);
+        piper.join().unwrap();
+    }
+
+    #[test]
+    fn feeder_receiver_timeout_and_try_while_running_and_closed_after_shutdown() {
+        let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
+        let input = builder.input();
+        let output = builder.link::<u32>();
+        builder.feeder_link(output, feeder_config());
+        let external_token = builder.add_external_node_to::<u32, u32>(input, "external", output);
+        let mut piper =
+            Piper::<u32, u32, TestError>::start(feeder_test_config(), builder.finish(output)).unwrap();
+        let external = piper.take_external_node(external_token);
+        let receiver = piper.receiver();
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(TryRecvOutputError::Empty)
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(5)),
+            Err(RecvOutputError::Timeout)
+        ));
+        assert!(matches!(
+            external.try_recv(),
+            Err(TryRecvOutputError::Empty)
+        ));
+        assert!(matches!(
+            external.recv_timeout(Duration::from_millis(5)),
+            Err(RecvOutputError::Timeout)
+        ));
+
+        piper.shutdown();
+        drop(external);
+        piper.join().unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            match receiver.try_recv() {
+                Err(TryRecvOutputError::Closed) => break,
+                Err(TryRecvOutputError::Empty) if std::time::Instant::now() >= deadline => {
+                    panic!("feeder receiver did not close after shutdown");
+                }
+                Ok(_) | Err(TryRecvOutputError::TypeMismatch) => {
+                    panic!("unexpected item after shutdown");
+                }
+                Err(TryRecvOutputError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(5)),
+            Err(RecvOutputError::Closed)
+        ));
+    }
+}
+
 struct Fail;
 
 impl Stage for Fail {
