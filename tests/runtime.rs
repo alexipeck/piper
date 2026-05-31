@@ -1,5 +1,5 @@
 use piper::{
-    CsvTelemetryConfig, IntoStageSpec, PipelineGraph, PipelineGraphBuilder, Piper, PiperConfig,
+    IntoStageSpec, PipelineGraph, PipelineGraphBuilder, Piper, PiperConfig, TelemetryLogConfig,
     PiperError, Stage, StageContext, anchor, inline_stage, pipeline, stage,
 };
 use std::fs;
@@ -451,10 +451,40 @@ fn piper_allows_zero_or_multiple_anchors() {
     two_anchors.join().unwrap();
 }
 
+fn read_telemetry_log(path: &std::path::Path) -> (serde_json::Value, Vec<String>, Vec<String>) {
+    let content = fs::read_to_string(path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines[0], "# piper-telemetry-log-v1");
+    assert!(lines[1].starts_with("# manifest "));
+    let manifest: serde_json::Value =
+        serde_json::from_str(lines[1].strip_prefix("# manifest ").unwrap()).unwrap();
+    let header = lines[2]
+        .split(',')
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let samples = lines[3..]
+        .iter()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_string())
+        .collect();
+    (manifest, header, samples)
+}
+
+fn fork_join_telemetry_graph() -> PipelineGraph<u32, u32, TestError> {
+    let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
+    let input = builder.input();
+    let fork = builder.add_stage(input, stage("prepare", Pass));
+    let merged = builder.link();
+    builder.add_stage_to(fork, stage("left", Pass), merged);
+    builder.add_stage_to(fork, stage("right", Pass), merged);
+    let output = builder.add_stage(merged, stage("merge", Pass));
+    builder.finish(output)
+}
+
 #[test]
-fn csv_telemetry_writes_wide_rows_and_existing_path_fails() {
+fn telemetry_log_writes_manifest_header_and_samples() {
     let path = std::env::temp_dir().join(format!(
-        "piper_test_{}_{}.csv",
+        "piper_test_{}_{}.piper.csv",
         std::process::id(),
         std::thread::current().name().unwrap_or("runtime")
     ));
@@ -462,7 +492,7 @@ fn csv_telemetry_writes_wide_rows_and_existing_path_fails() {
 
     let piper = Piper::<u32, u32, TestError>::start(
         PiperConfig {
-            csv_telemetry: Some(CsvTelemetryConfig::new(&path).interval(Duration::from_millis(5))),
+            csv_telemetry: Some(TelemetryLogConfig::new(&path).interval(Duration::from_millis(5))),
             ..config()
         },
         one_stage_graph(anchor(stage("pass", Pass)).max_threads(1)),
@@ -479,25 +509,102 @@ fn csv_telemetry_writes_wide_rows_and_existing_path_fails() {
     piper.shutdown();
     piper.join().unwrap();
 
-    let csv = fs::read_to_string(&path).unwrap();
-    assert!(csv.starts_with("elapsed_ms,shutdown_requested"));
-    assert!(csv.contains("link0_trend"));
-    assert!(csv.contains("stage0_service_time_ms"));
-    assert!(csv.contains("output_backpressure"));
-    assert!(csv.contains("anchor_count"));
-    assert!(csv.lines().count() >= 2);
+    let (manifest, header, samples) = read_telemetry_log(&path);
+    assert_eq!(manifest["format"], "piper-telemetry-log");
+    assert_eq!(manifest["version"], 1);
+    assert!(manifest["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|stage| stage["name"] == "pass"));
+    assert!(manifest["links"].as_array().unwrap().len() >= 2);
+    let link = manifest["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|link| link["producers"].as_array().unwrap().contains(&serde_json::json!("input")))
+        .expect("input link");
+    assert!(link["consumers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|consumer| consumer.as_str() == Some("stage0")));
+    assert!(!header.iter().any(|column| column == "stage0_name"));
+    assert!(!header.iter().any(|column| column == "anchor_count"));
+    assert!(header.contains(&"stage0_service_time_ms".to_string()));
+    assert!(header.contains(&"link0_arrival_rate".to_string()));
+    assert!(!samples.is_empty());
 
     let existing = Piper::<u32, u32, TestError>::start(
         PiperConfig {
-            csv_telemetry: Some(CsvTelemetryConfig::new(&path)),
+            csv_telemetry: Some(TelemetryLogConfig::new(&path)),
             ..config()
         },
         one_stage_graph(anchor(stage("pass", Pass)).max_threads(1)),
     );
     let Err(existing) = existing else {
-        panic!("existing CSV path should fail");
+        panic!("existing telemetry log path should fail");
     };
     assert!(matches!(existing, PiperError::Telemetry { .. }));
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn telemetry_log_manifest_classifies_fork_and_join_links() {
+    let path = std::env::temp_dir().join(format!(
+        "piper_fork_join_telemetry_{}_{}.piper.csv",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("runtime")
+    ));
+    let _ = fs::remove_file(&path);
+
+    let piper = Piper::<u32, u32, TestError>::start(
+        PiperConfig {
+            csv_telemetry: Some(TelemetryLogConfig::new(&path).interval(Duration::from_millis(5))),
+            ..config()
+        },
+        fork_join_telemetry_graph(),
+    )
+    .unwrap();
+    piper.sender().send(1).unwrap();
+    assert_eq!(
+        piper
+            .receiver()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap(),
+        1
+    );
+    piper.shutdown();
+    piper.join().unwrap();
+
+    let (manifest, _, _) = read_telemetry_log(&path);
+    let links = manifest["links"].as_array().unwrap();
+    let fork_link = links
+        .iter()
+        .find(|link| link["kind"] == "fork")
+        .expect("fork link");
+    assert_eq!(fork_link["producers"], serde_json::json!(["stage0"]));
+    assert!(fork_link["consumers"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("stage1")));
+    assert!(fork_link["consumers"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("stage2")));
+    let join_link = links
+        .iter()
+        .find(|link| link["kind"] == "join")
+        .expect("join link");
+    assert!(join_link["producers"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("stage1")));
+    assert!(join_link["producers"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("stage2")));
+    assert_eq!(join_link["consumers"], serde_json::json!(["output"]));
     let _ = fs::remove_file(&path);
 }
 

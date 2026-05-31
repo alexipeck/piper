@@ -1,5 +1,5 @@
 use piper::{
-    BufferLease, CsvTelemetryConfig, FeederLinkConfig, PipelineGraphBuilder, Piper, PiperConfig,
+    BufferLease, FeederLinkConfig, PipelineGraphBuilder, Piper, PiperConfig, TelemetryLogConfig,
     Stage, StageContext, StageExt, anchor, stage,
 };
 use std::sync::{
@@ -135,8 +135,8 @@ fn config() -> PiperConfig {
         poll_interval: Duration::from_millis(2),
         global_worker_cap: Some(max_parallelism().saturating_mul(2).max(4)),
         csv_telemetry: Some(
-            CsvTelemetryConfig::new(format!(
-                "piper_fork_join_feeder_{}.csv",
+            TelemetryLogConfig::new(format!(
+                "piper_fork_join_feeder_{}.piper.csv",
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()

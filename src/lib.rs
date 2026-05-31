@@ -2,6 +2,7 @@
 compile_error!("enable `channel-kanal` or `channel-crossbeam`");
 
 use parking_lot::RwLock;
+use serde::Serialize;
 use std::any::Any;
 #[cfg(feature = "feeder")]
 use std::collections::HashMap;
@@ -203,7 +204,7 @@ pub struct PiperConfig {
     pub sample_interval: Duration,
     pub poll_interval: Duration,
     pub global_worker_cap: Option<usize>,
-    pub csv_telemetry: Option<CsvTelemetryConfig>,
+    pub csv_telemetry: Option<TelemetryLogConfig>,
 }
 
 impl Default for PiperConfig {
@@ -218,12 +219,12 @@ impl Default for PiperConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct CsvTelemetryConfig {
+pub struct TelemetryLogConfig {
     pub path: PathBuf,
     pub interval: Duration,
 }
 
-impl CsvTelemetryConfig {
+impl TelemetryLogConfig {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
@@ -2446,11 +2447,13 @@ where
             pending_scale_operation: false,
         }));
 
-        let csv_recorder = start_csv_recorder(
+        let csv_recorder = start_telemetry_log_recorder(
             config.csv_telemetry.clone(),
             Arc::clone(&snapshot),
             internal_failure_sender.clone(),
             Arc::clone(&abort),
+            input_link,
+            output_link,
         )?;
 
         let supervisor_snapshot = Arc::clone(&snapshot);
@@ -2560,12 +2563,66 @@ where
     }
 }
 
-struct CsvRecorder {
+const TELEMETRY_LOG_VERSION_LINE: &str = "# piper-telemetry-log-v1";
+const TELEMETRY_MANIFEST_PREFIX: &str = "# manifest ";
+
+#[derive(Serialize)]
+struct TelemetryLogManifest {
+    version: u32,
+    format: &'static str,
+    links: Vec<ManifestLink>,
+    stages: Vec<ManifestStage>,
+    anchors: Vec<ManifestAnchor>,
+    metrics: Vec<ManifestMetric>,
+}
+
+#[derive(Serialize)]
+struct ManifestStage {
+    id: String,
+    index: usize,
+    name: String,
+    input_link: String,
+    output_link: String,
+    is_anchor: bool,
+    is_fixed_anchor: bool,
+    is_external: bool,
+}
+
+#[derive(Serialize)]
+struct ManifestLink {
+    id: String,
+    index: usize,
+    kind: String,
+    label: String,
+    producers: Vec<String>,
+    consumers: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ManifestAnchor {
+    id: String,
+    index: usize,
+    name: String,
+}
+
+#[derive(Serialize)]
+struct ManifestMetric {
+    column: String,
+    object_id: String,
+    object_kind: String,
+    category: String,
+    metric: String,
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unit: Option<String>,
+}
+
+struct TelemetryLogRecorder {
     stop: Arc<AtomicBool>,
     handle: JoinHandle<()>,
 }
 
-impl CsvRecorder {
+impl TelemetryLogRecorder {
     fn stop<E>(self) -> Result<(), E>
     where
         E: Debug + Display + Send + 'static,
@@ -2574,18 +2631,20 @@ impl CsvRecorder {
         self.handle
             .join()
             .map_err(|payload| PiperError::WorkerPanicked {
-                worker: "piper-csv-telemetry".to_string(),
+                worker: "piper-telemetry-log".to_string(),
                 message: panic_payload_to_string(payload),
             })
     }
 }
 
-fn start_csv_recorder<E>(
-    config: Option<CsvTelemetryConfig>,
+fn start_telemetry_log_recorder<E>(
+    config: Option<TelemetryLogConfig>,
     snapshot: Arc<RwLock<PiperSnapshot>>,
     failure_sender: channel::Sender<InternalFailure>,
     abort: Arc<AtomicBool>,
-) -> Result<Option<CsvRecorder>, E>
+    input_link: usize,
+    output_link: usize,
+) -> Result<Option<TelemetryLogRecorder>, E>
 where
     E: Debug + Display + Send + 'static,
 {
@@ -2599,23 +2658,44 @@ where
         .open(&config.path)
         .map_err(|source| PiperError::Telemetry {
             message: format!(
-                "failed to create CSV telemetry file `{}`: {source}",
+                "failed to create telemetry log file `{}`: {source}",
                 config.path.display()
             ),
         })?;
     let mut writer = BufWriter::new(file);
     let initial_snapshot = snapshot.read().clone();
-    writeln!(writer, "{}", csv_header(&initial_snapshot)).map_err(|source| {
+    let manifest = build_telemetry_manifest(&initial_snapshot, input_link, output_link);
+    writeln!(writer, "{TELEMETRY_LOG_VERSION_LINE}").map_err(|source| PiperError::Telemetry {
+        message: format!(
+            "failed to write telemetry log version line `{}`: {source}",
+            config.path.display()
+        ),
+    })?;
+    let manifest_json = serde_json::to_string(&manifest).map_err(|source| PiperError::Telemetry {
+        message: format!(
+            "failed to serialize telemetry manifest `{}`: {source}",
+            config.path.display()
+        ),
+    })?;
+    writeln!(writer, "{TELEMETRY_MANIFEST_PREFIX}{manifest_json}").map_err(|source| {
         PiperError::Telemetry {
             message: format!(
-                "failed to write CSV telemetry header `{}`: {source}",
+                "failed to write telemetry manifest `{}`: {source}",
+                config.path.display()
+            ),
+        }
+    })?;
+    writeln!(writer, "{}", telemetry_log_header(&manifest)).map_err(|source| {
+        PiperError::Telemetry {
+            message: format!(
+                "failed to write telemetry log header `{}`: {source}",
                 config.path.display()
             ),
         }
     })?;
     writer.flush().map_err(|source| PiperError::Telemetry {
         message: format!(
-            "failed to flush CSV telemetry header `{}`: {source}",
+            "failed to flush telemetry log header `{}`: {source}",
             config.path.display()
         ),
     })?;
@@ -2624,19 +2704,23 @@ where
     let thread_stop = Arc::clone(&stop);
     let path = config.path.clone();
     let handle = thread::Builder::new()
-        .name("piper-csv-telemetry".to_string())
+        .name("piper-telemetry-log".to_string())
         .spawn(move || {
             let started = Instant::now();
             loop {
                 thread::sleep(config.interval);
                 let stopping = thread_stop.load(Ordering::Acquire) || abort.load(Ordering::Acquire);
                 let snapshot = snapshot.read().clone();
-                if let Err(source) = writeln!(writer, "{}", csv_row(started.elapsed(), &snapshot))
-                    .and_then(|_| writer.flush())
+                if let Err(source) = writeln!(
+                    writer,
+                    "{}",
+                    telemetry_log_row(started.elapsed(), &snapshot, &manifest)
+                )
+                .and_then(|_| writer.flush())
                 {
                     abort.store(true, Ordering::Release);
                     let _ = failure_sender.send(InternalFailure::telemetry(format!(
-                        "failed to write CSV telemetry file `{}`: {source}",
+                        "failed to write telemetry log file `{}`: {source}",
                         path.display()
                     )));
                     break;
@@ -2647,137 +2731,501 @@ where
             }
         })
         .map_err(|source| PiperError::SpawnFailed {
-            worker: "piper-csv-telemetry".to_string(),
+            worker: "piper-telemetry-log".to_string(),
             source,
         })?;
 
-    Ok(Some(CsvRecorder { stop, handle }))
+    Ok(Some(TelemetryLogRecorder { stop, handle }))
 }
 
-fn csv_header(snapshot: &PiperSnapshot) -> String {
-    let mut fields = vec![
-        "elapsed_ms".to_string(),
-        "shutdown_requested".to_string(),
-        "abort_requested".to_string(),
-        "pending_scale_operation".to_string(),
-        "parked_threads".to_string(),
-        "total_active_workers".to_string(),
-        "global_worker_cap".to_string(),
-        "budget_pressure".to_string(),
-        "output_backpressure".to_string(),
-        "anchor_count".to_string(),
-    ];
-
-    for index in 0..snapshot.anchors.len() {
-        fields.push(format!("anchor{index}_index"));
-        fields.push(format!("anchor{index}_name"));
-        fields.push(format!("anchor{index}_active_threads"));
-        fields.push(format!("anchor{index}_max_threads"));
-        fields.push(format!("anchor{index}_fixed_threads"));
-        fields.push(format!("anchor{index}_probe_state"));
-        fields.push(format!("anchor{index}_last_probe_outcome"));
-        fields.push(format!("anchor{index}_last_probe_reason"));
-    }
-
-    for link in &snapshot.links {
-        fields.push(format!("link{}_len", link.index));
-        fields.push(format!("link{}_trend", link.index));
-        fields.push(format!("link{}_arrival_rate", link.index));
-        fields.push(format!("link{}_drain_rate", link.index));
-        fields.push(format!("link{}_net_rate", link.index));
-        fields.push(format!("link{}_smoothed_len", link.index));
-    }
-
-    for stage in &snapshot.stages {
-        fields.push(format!("stage{}_name", stage.index));
-        fields.push(format!("stage{}_input_link", stage.index));
-        fields.push(format!("stage{}_output_link", stage.index));
-        fields.push(format!("stage{}_active_threads", stage.index));
-        fields.push(format!("stage{}_processed_count", stage.index));
-        fields.push(format!("stage{}_busy_ratio", stage.index));
-        fields.push(format!("stage{}_service_time_ms", stage.index));
-        fields.push(format!("stage{}_per_worker_throughput", stage.index));
-        fields.push(format!("stage{}_desired_workers", stage.index));
-        fields.push(format!("stage{}_scaling_state", stage.index));
-        fields.push(format!("stage{}_is_anchor", stage.index));
-        fields.push(format!("stage{}_is_fixed_anchor", stage.index));
-        fields.push(format!("stage{}_is_external", stage.index));
-        fields.push(format!("stage{}_external_input_rate", stage.index));
-        fields.push(format!("stage{}_external_output_rate", stage.index));
-    }
-
-    fields.join(",")
+fn link_object_id(index: usize) -> String {
+    format!("link{index}")
 }
 
-fn csv_row(elapsed: Duration, snapshot: &PiperSnapshot) -> String {
-    let mut fields = vec![
-        format!("{:.3}", elapsed.as_secs_f64() * 1000.0),
-        snapshot.shutdown_requested.to_string(),
-        snapshot.abort_requested.to_string(),
-        snapshot.pending_scale_operation.to_string(),
-        snapshot.parked_threads.to_string(),
-        snapshot.total_active_workers.to_string(),
-        snapshot.global_worker_cap.to_string(),
-        snapshot.budget_pressure.to_string(),
-        snapshot.output_backpressure.to_string(),
-        snapshot.anchors.len().to_string(),
-    ];
-
-    for anchor in &snapshot.anchors {
-        fields.push(anchor.stage_index.to_string());
-        fields.push(csv_escape(&anchor.stage_name));
-        fields.push(anchor.active_threads.to_string());
-        fields.push(anchor.max_threads.to_string());
-        fields.push(
-            anchor
-                .fixed_threads
-                .map(|threads| threads.to_string())
-                .unwrap_or_default(),
-        );
-        fields.push(format!("{:?}", anchor.probe_state));
-        fields.push(format!("{:?}", anchor.last_probe_outcome));
-        fields.push(format!("{:?}", anchor.last_probe_reason));
-    }
-
-    for link in &snapshot.links {
-        fields.push(link.len.to_string());
-        fields.push(link.trend.code().to_string());
-        fields.push(format!("{:.6}", link.arrival_rate));
-        fields.push(format!("{:.6}", link.drain_rate));
-        fields.push(format!("{:.6}", link.net_rate));
-        fields.push(format!("{:.6}", link.smoothed_len));
-    }
-
-    for stage in &snapshot.stages {
-        fields.push(csv_escape(&stage.name));
-        fields.push(stage.input_link.to_string());
-        fields.push(stage.output_link.to_string());
-        fields.push(stage.active_threads.to_string());
-        fields.push(stage.processed_count.to_string());
-        fields.push(format!("{:.6}", stage.busy_ratio));
-        fields.push(format!("{:.3}", stage.service_time.as_secs_f64() * 1000.0));
-        fields.push(format!("{:.6}", stage.per_worker_throughput));
-        fields.push(stage.desired_workers.to_string());
-        fields.push(format!("{:?}", stage.scaling_state));
-        fields.push(stage.is_anchor.to_string());
-        fields.push(stage.is_fixed_anchor.to_string());
-        fields.push(stage.is_external.to_string());
-        fields.push(format!("{:.6}", stage.external_input_rate));
-        fields.push(format!("{:.6}", stage.external_output_rate));
-    }
-
-    fields.join(",")
+fn stage_object_id(index: usize) -> String {
+    format!("stage{index}")
 }
 
-fn csv_escape(value: &str) -> String {
-    if value
-        .chars()
-        .any(|ch| matches!(ch, ',' | '"' | '\n' | '\r'))
-    {
-        format!("\"{}\"", value.replace('"', "\"\""))
+fn anchor_object_id(index: usize) -> String {
+    format!("anchor{index}")
+}
+
+fn manifest_stage_name<'a>(stage_id: &'a str, stages: &'a [ManifestStage]) -> &'a str {
+    if stage_id == "input" {
+        return "input";
+    }
+    if stage_id == "output" {
+        return "output";
+    }
+    stages
+        .iter()
+        .find(|stage| stage.id == stage_id)
+        .map(|stage| stage.name.as_str())
+        .unwrap_or(stage_id)
+}
+
+fn format_manifest_node_list(ids: &[String], stages: &[ManifestStage]) -> String {
+    let names: Vec<&str> = ids
+        .iter()
+        .map(|id| manifest_stage_name(id, stages))
+        .collect();
+    if names.len() == 1 {
+        names[0].to_string()
     } else {
-        value.to_string()
+        format!("{{{}}}", names.join(", "))
     }
+}
+
+fn manifest_link_kind(
+    link_index: usize,
+    input_link: usize,
+    output_link: usize,
+    producers: &[String],
+    consumers: &[String],
+) -> &'static str {
+    if link_index == input_link {
+        return "input";
+    }
+    if link_index == output_link {
+        return "output";
+    }
+    match (producers.len(), consumers.len()) {
+        (1, 1) => "internal",
+        (1, _) if consumers.len() > 1 => "fork",
+        (_, 1) if producers.len() > 1 => "join",
+        (producer_count, consumer_count) if producer_count > 1 && consumer_count > 1 => "fork_join",
+        _ => "internal",
+    }
+}
+
+fn manifest_link_label(
+    kind: &str,
+    producers: &[String],
+    consumers: &[String],
+    stages: &[ManifestStage],
+) -> String {
+    match kind {
+        "input" => format!(
+            "input -> {}",
+            format_manifest_node_list(consumers, stages)
+        ),
+        "output" => format!(
+            "{} -> output",
+            format_manifest_node_list(producers, stages)
+        ),
+        "fork" => format!(
+            "{} -> {}",
+            manifest_stage_name(&producers[0], stages),
+            format_manifest_node_list(consumers, stages)
+        ),
+        "join" => format!(
+            "{} -> {}",
+            format_manifest_node_list(producers, stages),
+            manifest_stage_name(&consumers[0], stages)
+        ),
+        "fork_join" => format!(
+            "{} -> {}",
+            format_manifest_node_list(producers, stages),
+            format_manifest_node_list(consumers, stages)
+        ),
+        _ => format!(
+            "{} -> {}",
+            manifest_stage_name(&producers[0], stages),
+            manifest_stage_name(&consumers[0], stages)
+        ),
+    }
+}
+
+fn push_manifest_metric(
+    metrics: &mut Vec<ManifestMetric>,
+    column: impl Into<String>,
+    object_id: impl Into<String>,
+    object_kind: impl Into<String>,
+    category: impl Into<String>,
+    metric: impl Into<String>,
+    label: impl Into<String>,
+    unit: Option<&str>,
+) {
+    metrics.push(ManifestMetric {
+        column: column.into(),
+        object_id: object_id.into(),
+        object_kind: object_kind.into(),
+        category: category.into(),
+        metric: metric.into(),
+        label: label.into(),
+        unit: unit.map(str::to_string),
+    });
+}
+
+fn build_telemetry_manifest(
+    snapshot: &PiperSnapshot,
+    input_link: usize,
+    output_link: usize,
+) -> TelemetryLogManifest {
+    let link_count = snapshot.links.len();
+    let mut producers_by_link = vec![Vec::<String>::new(); link_count];
+    let mut consumers_by_link = vec![Vec::<String>::new(); link_count];
+
+    let stages: Vec<ManifestStage> = snapshot
+        .stages
+        .iter()
+        .map(|stage| ManifestStage {
+            id: stage_object_id(stage.index),
+            index: stage.index,
+            name: stage.name.clone(),
+            input_link: link_object_id(stage.input_link),
+            output_link: link_object_id(stage.output_link),
+            is_anchor: stage.is_anchor,
+            is_fixed_anchor: stage.is_fixed_anchor,
+            is_external: stage.is_external,
+        })
+        .collect();
+
+    for stage in &snapshot.stages {
+        let stage_id = stage_object_id(stage.index);
+        consumers_by_link[stage.input_link].push(stage_id.clone());
+        producers_by_link[stage.output_link].push(stage_id);
+    }
+    producers_by_link[input_link] = vec!["input".to_string()];
+    for link_index in 0..link_count {
+        if link_index == output_link {
+            consumers_by_link[link_index] = vec!["output".to_string()];
+            continue;
+        }
+        if producers_by_link[link_index].len() > 1 && consumers_by_link[link_index].len() == 1 {
+            let consumer_id = &consumers_by_link[link_index][0];
+            if let Some(stage) = snapshot
+                .stages
+                .iter()
+                .find(|stage| stage_object_id(stage.index) == *consumer_id)
+            {
+                if stage.output_link == output_link {
+                    consumers_by_link[link_index] = vec!["output".to_string()];
+                }
+            }
+        }
+    }
+
+    let links: Vec<ManifestLink> = snapshot
+        .links
+        .iter()
+        .map(|link| {
+            let producers = producers_by_link[link.index].clone();
+            let consumers = consumers_by_link[link.index].clone();
+            let kind = manifest_link_kind(link.index, input_link, output_link, &producers, &consumers)
+                .to_string();
+            let label = manifest_link_label(&kind, &producers, &consumers, &stages);
+            ManifestLink {
+                id: link_object_id(link.index),
+                index: link.index,
+                kind,
+                label,
+                producers,
+                consumers,
+            }
+        })
+        .collect();
+
+    let anchors: Vec<ManifestAnchor> = snapshot
+        .anchors
+        .iter()
+        .enumerate()
+        .map(|(index, anchor)| ManifestAnchor {
+            id: anchor_object_id(index),
+            index,
+            name: anchor.stage_name.clone(),
+        })
+        .collect();
+
+    let mut metrics = Vec::new();
+    push_manifest_metric(
+        &mut metrics,
+        "shutdown_requested",
+        "pipeline",
+        "pipeline",
+        "Pipeline",
+        "shutdown_requested",
+        "shutdown requested",
+        None,
+    );
+    push_manifest_metric(
+        &mut metrics,
+        "abort_requested",
+        "pipeline",
+        "pipeline",
+        "Pipeline",
+        "abort_requested",
+        "abort requested",
+        None,
+    );
+    push_manifest_metric(
+        &mut metrics,
+        "pending_scale_operation",
+        "pipeline",
+        "pipeline",
+        "Pipeline",
+        "pending_scale_operation",
+        "pending scale operation",
+        None,
+    );
+    push_manifest_metric(
+        &mut metrics,
+        "parked_threads",
+        "pipeline",
+        "pipeline",
+        "Pipeline",
+        "parked_threads",
+        "parked threads",
+        None,
+    );
+    push_manifest_metric(
+        &mut metrics,
+        "total_active_workers",
+        "pipeline",
+        "pipeline",
+        "Pipeline",
+        "total_active_workers",
+        "active workers",
+        None,
+    );
+    push_manifest_metric(
+        &mut metrics,
+        "global_worker_cap",
+        "pipeline",
+        "pipeline",
+        "Pipeline",
+        "global_worker_cap",
+        "global worker cap",
+        None,
+    );
+    push_manifest_metric(
+        &mut metrics,
+        "budget_pressure",
+        "pipeline",
+        "pipeline",
+        "Pipeline",
+        "budget_pressure",
+        "budget pressure",
+        None,
+    );
+    push_manifest_metric(
+        &mut metrics,
+        "output_backpressure",
+        "pipeline",
+        "pipeline",
+        "Pipeline",
+        "output_backpressure",
+        "output backpressure",
+        None,
+    );
+
+    for link in &snapshot.links {
+        let object_id = link_object_id(link.index);
+        for (metric, label, unit) in [
+            ("len", "queue length", None),
+            ("trend", "queue trend", None),
+            ("arrival_rate", "arrival rate", Some("items/s")),
+            ("drain_rate", "drain rate", Some("items/s")),
+            ("net_rate", "net rate", Some("items/s")),
+            ("smoothed_len", "smoothed length", None),
+        ] {
+            push_manifest_metric(
+                &mut metrics,
+                format!("link{}_{metric}", link.index),
+                &object_id,
+                "link",
+                "Links",
+                metric,
+                label,
+                unit,
+            );
+        }
+    }
+
+    for stage in &snapshot.stages {
+        let object_id = stage_object_id(stage.index);
+        for (metric, label, unit) in [
+            ("active_threads", "active threads", None),
+            ("processed_count", "processed count", None),
+            ("busy_ratio", "busy ratio", None),
+            ("service_time_ms", "service time", Some("ms")),
+            ("per_worker_throughput", "per-worker throughput", Some("items/s")),
+            ("desired_workers", "desired workers", None),
+            ("scaling_state", "scaling state", None),
+        ] {
+            push_manifest_metric(
+                &mut metrics,
+                format!("stage{}_{metric}", stage.index),
+                &object_id,
+                "stage",
+                "Stages",
+                metric,
+                label,
+                unit,
+            );
+        }
+        if stage.is_external {
+            for (metric, label) in [
+                ("external_input_rate", "external input rate"),
+                ("external_output_rate", "external output rate"),
+            ] {
+                push_manifest_metric(
+                    &mut metrics,
+                    format!("stage{}_{metric}", stage.index),
+                    &object_id,
+                    "stage",
+                    "External",
+                    metric,
+                    label,
+                    Some("items/s"),
+                );
+            }
+        }
+    }
+
+    for (index, _anchor) in snapshot.anchors.iter().enumerate() {
+        let object_id = anchor_object_id(index);
+        for (metric, label) in [
+            ("active_threads", "active threads"),
+            ("max_threads", "max threads"),
+            ("fixed_threads", "fixed threads"),
+            ("probe_state", "probe state"),
+            ("last_probe_outcome", "last probe outcome"),
+            ("last_probe_reason", "last probe reason"),
+        ] {
+            push_manifest_metric(
+                &mut metrics,
+                format!("anchor{index}_{metric}"),
+                &object_id,
+                "anchor",
+                "Anchors",
+                metric,
+                label,
+                None,
+            );
+        }
+    }
+
+    TelemetryLogManifest {
+        version: 1,
+        format: "piper-telemetry-log",
+        links,
+        stages,
+        anchors,
+        metrics,
+    }
+}
+
+fn telemetry_log_header(manifest: &TelemetryLogManifest) -> String {
+    let mut fields = vec!["elapsed_ms".to_string()];
+    fields.extend(
+        manifest
+            .metrics
+            .iter()
+            .map(|metric| metric.column.clone()),
+    );
+    fields.join(",")
+}
+
+fn telemetry_log_metric_value(column: &str, snapshot: &PiperSnapshot) -> String {
+    match column {
+        "shutdown_requested" => snapshot.shutdown_requested.to_string(),
+        "abort_requested" => snapshot.abort_requested.to_string(),
+        "pending_scale_operation" => snapshot.pending_scale_operation.to_string(),
+        "parked_threads" => snapshot.parked_threads.to_string(),
+        "total_active_workers" => snapshot.total_active_workers.to_string(),
+        "global_worker_cap" => snapshot.global_worker_cap.to_string(),
+        "budget_pressure" => snapshot.budget_pressure.to_string(),
+        "output_backpressure" => snapshot.output_backpressure.to_string(),
+        _ => {
+            if let Some(rest) = column.strip_prefix("link") {
+                if let Some((index, metric)) = rest.split_once('_') {
+                    if let Ok(link_index) = index.parse::<usize>() {
+                        if let Some(link) = snapshot.links.iter().find(|link| link.index == link_index)
+                        {
+                            return match metric {
+                                "len" => link.len.to_string(),
+                                "trend" => link.trend.code().to_string(),
+                                "arrival_rate" => format!("{:.6}", link.arrival_rate),
+                                "drain_rate" => format!("{:.6}", link.drain_rate),
+                                "net_rate" => format!("{:.6}", link.net_rate),
+                                "smoothed_len" => format!("{:.6}", link.smoothed_len),
+                                _ => String::new(),
+                            };
+                        }
+                    }
+                }
+            }
+            if let Some(rest) = column.strip_prefix("stage") {
+                if let Some((index, metric)) = rest.split_once('_') {
+                    if let Ok(stage_index) = index.parse::<usize>() {
+                        if let Some(stage) =
+                            snapshot.stages.iter().find(|stage| stage.index == stage_index)
+                        {
+                            return match metric {
+                                "active_threads" => stage.active_threads.to_string(),
+                                "processed_count" => stage.processed_count.to_string(),
+                                "busy_ratio" => format!("{:.6}", stage.busy_ratio),
+                                "service_time_ms" => {
+                                    format!("{:.3}", stage.service_time.as_secs_f64() * 1000.0)
+                                }
+                                "per_worker_throughput" => {
+                                    format!("{:.6}", stage.per_worker_throughput)
+                                }
+                                "desired_workers" => stage.desired_workers.to_string(),
+                                "scaling_state" => format!("{:?}", stage.scaling_state),
+                                "external_input_rate" => {
+                                    format!("{:.6}", stage.external_input_rate)
+                                }
+                                "external_output_rate" => {
+                                    format!("{:.6}", stage.external_output_rate)
+                                }
+                                _ => String::new(),
+                            };
+                        }
+                    }
+                }
+            }
+            if let Some(rest) = column.strip_prefix("anchor") {
+                if let Some((index, metric)) = rest.split_once('_') {
+                    if let Ok(anchor_index) = index.parse::<usize>() {
+                        if let Some(anchor) = snapshot.anchors.get(anchor_index) {
+                            return match metric {
+                                "active_threads" => anchor.active_threads.to_string(),
+                                "max_threads" => anchor.max_threads.to_string(),
+                                "fixed_threads" => anchor
+                                    .fixed_threads
+                                    .map(|threads| threads.to_string())
+                                    .unwrap_or_default(),
+                                "probe_state" => format!("{:?}", anchor.probe_state),
+                                "last_probe_outcome" => {
+                                    format!("{:?}", anchor.last_probe_outcome)
+                                }
+                                "last_probe_reason" => format!("{:?}", anchor.last_probe_reason),
+                                _ => String::new(),
+                            };
+                        }
+                    }
+                }
+            }
+            String::new()
+        }
+    }
+}
+
+fn telemetry_log_row(
+    elapsed: Duration,
+    snapshot: &PiperSnapshot,
+    manifest: &TelemetryLogManifest,
+) -> String {
+    let mut fields = vec![format!("{:.3}", elapsed.as_secs_f64() * 1000.0)];
+    fields.extend(
+        manifest
+            .metrics
+            .iter()
+            .map(|metric| telemetry_log_metric_value(&metric.column, snapshot)),
+    );
+    fields.join(",")
 }
 
 fn run_supervisor<E>(
@@ -2791,7 +3239,7 @@ fn run_supervisor<E>(
     snapshot: Arc<RwLock<PiperSnapshot>>,
     internal_failure_sender: channel::Sender<InternalFailure>,
     internal_failure_receiver: channel::Receiver<InternalFailure>,
-    mut csv_recorder: Option<CsvRecorder>,
+    mut csv_recorder: Option<TelemetryLogRecorder>,
     startup_ready_tx: channel::Sender<()>,
 ) -> Result<(), E>
 where

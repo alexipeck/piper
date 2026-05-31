@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Piper CSV Viewer</title>
+  <title>Piper Telemetry Viewer</title>
   <!-- Session (path, columns, zoom, etc.) is saved in localStorage and restored on reload via path re-fetch. -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
   <style>
@@ -94,7 +94,7 @@
       min-height: 0;
     }
     .sidebar {
-      width: 240px;
+      width: 280px;
       flex-shrink: 0;
       border-right: 1px solid #2a2f38;
       display: flex;
@@ -139,64 +139,59 @@
       flex-shrink: 0;
     }
     .mini-btn:hover { background: #354052; }
-    .word-groups {
+    .dash-section {
       border-bottom: 1px solid #2a2f38;
-      max-height: 200px;
-      overflow-y: auto;
-      padding: 6px 8px;
+      padding: 8px 10px;
       flex-shrink: 0;
     }
-    .word-groups-title {
+    .dash-section.scrollable {
+      max-height: 160px;
+      overflow-y: auto;
+    }
+    .dash-title {
       font-size: 11px;
       color: #8b93a1;
       margin-bottom: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
     }
-    .word-group-row {
+    .dash-presets {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+    .dash-presets button {
+      font-size: 11px;
+      padding: 3px 8px;
+      background: #2a3140;
+      border: 1px solid #3d4656;
+      color: #d8dce3;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .dash-presets button:hover { background: #354052; }
+    .dash-row {
       display: flex;
       align-items: center;
       gap: 6px;
-      padding: 3px 0;
+      padding: 2px 0;
       font-size: 11px;
+      cursor: pointer;
     }
-    .word-group-row.hidden-filter { display: none; }
-    .word-group-label {
+    .dash-row:hover { background: #22262e; }
+    .dash-row.focused { background: #253045; color: #d8dce3; }
+    .dash-row input { margin: 0; cursor: pointer; }
+    .dash-row span {
       flex: 1;
       min-width: 0;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
-      color: #d8dce3;
     }
-    .word-group-count {
-      color: #6b7280;
-      flex-shrink: 0;
-    }
-    .word-group-actions {
-      display: flex;
-      gap: 4px;
-      flex-shrink: 0;
-    }
-    .column-list {
+    .sidebar-scroll {
       flex: 1;
       overflow-y: auto;
-      padding: 6px 0;
-    }
-    .column-item {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 4px 10px;
-      cursor: pointer;
-      user-select: none;
-    }
-    .column-item:hover { background: #22262e; }
-    .column-item.hidden-filter { display: none; }
-    .column-item input { margin: 0; cursor: pointer; }
-    .column-item span {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      font-size: 12px;
+      min-height: 0;
     }
     .main {
       flex: 1;
@@ -205,7 +200,7 @@
       min-width: 0;
     }
     .chart-section {
-      flex: 3;
+      flex: 1;
       display: flex;
       flex-direction: column;
       min-height: 200px;
@@ -314,47 +309,9 @@
       border-radius: 2px;
       flex-shrink: 0;
     }
-    .table-section {
-      flex: 2;
-      display: flex;
-      flex-direction: column;
-      min-height: 140px;
-    }
-    .table-wrap {
-      flex: 1;
-      overflow: auto;
-      min-height: 0;
-    }
-    table {
-      border-collapse: collapse;
-      width: max-content;
-      min-width: 100%;
-    }
-    thead th {
-      position: sticky;
-      top: 0;
-      z-index: 2;
-      background: #1f2430;
-      border-bottom: 2px solid #3d4656;
-      padding: 6px 10px;
-      text-align: left;
-      font-weight: 600;
-      white-space: nowrap;
-      font-variant-numeric: tabular-nums;
-    }
-    tbody td {
-      padding: 4px 10px;
-      border-bottom: 1px solid #232830;
-      white-space: nowrap;
-      font-variant-numeric: tabular-nums;
-    }
-    tbody tr { cursor: pointer; }
-    tbody tr:hover { background: #1e232c; }
-    tbody tr.selected { background: #253045; }
-    tbody tr.selected td { border-bottom-color: #354052; }
-    .detail {
+    .inspector {
       flex-shrink: 0;
-      max-height: 120px;
+      max-height: 180px;
       overflow: auto;
       border-top: 1px solid #2a2f38;
       background: #181b21;
@@ -405,15 +362,14 @@
   <div class="toolbar" id="toolbar">
     <label class="file-picker">
       <span class="file-picker-btn">Choose file</span>
-      <input type="file" id="fileInput" class="file-picker-input" accept=".csv,text/csv">
+      <input type="file" id="fileInput" class="file-picker-input" accept=".piper.csv,.csv,text/csv">
       <span class="file-picker-name" id="fileInputLabel">No file chosen</span>
     </label>
-    <input type="text" class="csv-path" id="csvPathInput" placeholder="C:\full\path\to\file.csv">
+    <input type="text" class="csv-path" id="csvPathInput" placeholder="C:\full\path\to\file.piper.csv">
     <button type="button" id="csvPathLoad">Load path</button>
     <button type="button" id="clearSaved">Clear saved</button>
     <span class="drop-hint" id="dropHint">Session saves path and settings — reload restores via path field</span>
     <label><input type="checkbox" id="logScale"> Log Y</label>
-    <label><input type="checkbox" id="showAllRows" checked> Show all rows</label>
     <button type="button" id="prevRow" disabled>&larr;</button>
     <input type="range" id="rowSlider" min="0" max="0" value="0" disabled>
     <button type="button" id="nextRow" disabled>&rarr;</button>
@@ -422,18 +378,28 @@
   </div>
   <div class="layout">
     <aside class="sidebar">
-      <div class="sidebar-head">
-        <input type="search" id="columnSearch" placeholder="Filter columns…" disabled>
-        <div class="sidebar-actions">
-          <button type="button" id="selectAll" disabled>All</button>
-          <button type="button" id="selectNone" disabled>None</button>
+      <div class="dash-section">
+        <div class="dash-title">Presets</div>
+        <div class="dash-presets" id="presetButtons"></div>
+      </div>
+      <div class="sidebar-scroll">
+        <div class="dash-section scrollable">
+          <div class="dash-title">Topology</div>
+          <div id="topologyList"></div>
+        </div>
+        <div class="dash-section">
+          <div class="dash-title">Categories</div>
+          <div id="categoryToggles"></div>
+        </div>
+        <div class="dash-section scrollable">
+          <div class="dash-title">Metrics</div>
+          <div id="metricToggles"></div>
+        </div>
+        <div class="dash-section scrollable">
+          <div class="dash-title">Objects</div>
+          <div id="objectToggles"></div>
         </div>
       </div>
-      <div class="word-groups" id="wordGroups" hidden>
-        <div class="word-groups-title">Groups by word</div>
-        <div class="word-groups-list" id="wordGroupsList"></div>
-      </div>
-      <div class="column-list" id="columnList"></div>
     </aside>
     <div class="main">
       <section class="chart-section" id="chartSection">
@@ -454,24 +420,15 @@
           </div>
         </div>
         <div class="chart-wrap" id="chartWrap">
-          <p class="empty-state" id="chartEmpty">Load CSV and select numeric columns to graph.</p>
+          <p class="empty-state" id="chartEmpty">Load a Piper telemetry log and enable metrics to graph.</p>
           <div id="chartHost"></div>
         </div>
         <div class="chart-legend" id="chartLegend"></div>
       </section>
-      <div class="table-section">
-        <div class="table-wrap" id="tableWrap" tabindex="0">
-          <p class="empty-state" id="emptyState">Load a Piper CSV to begin.</p>
-          <table id="dataTable" hidden>
-            <thead id="tableHead"></thead>
-            <tbody id="tableBody"></tbody>
-          </table>
-        </div>
-        <section class="detail" id="detailPanel" hidden>
-          <h3 id="detailTitle">Row detail</h3>
-          <dl class="detail-grid" id="detailGrid"></dl>
-        </section>
-      </div>
+      <section class="inspector" id="inspectorPanel" hidden>
+        <h3 id="inspectorTitle">Sample inspector</h3>
+        <dl class="detail-grid" id="inspectorGrid"></dl>
+      </section>
     </div>
   </div>
   <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
@@ -481,14 +438,25 @@
       "#fb7185", "#38bdf8", "#fbbf24", "#4ade80", "#c084fc",
     ];
 
+    const CATEGORIES = ["Pipeline", "Links", "Stages", "Anchors", "External"];
+    const PRESETS = {
+      Queues: ["len", "smoothed_len", "trend"],
+      Rates: ["arrival_rate", "drain_rate", "net_rate", "external_input_rate", "external_output_rate"],
+      Workers: ["active_threads", "desired_workers", "total_active_workers", "parked_threads", "global_worker_cap"],
+      Anchors: ["probe_state", "last_probe_outcome", "last_probe_reason", "max_threads", "fixed_threads"],
+      External: ["external_input_rate", "external_output_rate"],
+    };
+
     const state = {
+      manifest: null,
       headers: [],
-      rows: [],
-      visible: [],
+      metricsByColumn: new Map(),
+      columnData: new Map(),
+      sampleCount: 0,
+      enabledCategories: new Set(CATEGORIES),
+      enabledMetrics: new Set(),
+      focusedObjectIds: new Set(),
       selectedRowIndex: 0,
-      showAllRows: true,
-      searchQuery: "",
-      wordGroups: [],
       logScale: false,
       yMin: null,
       yMax: null,
@@ -503,7 +471,6 @@
       pickedPlotSeries: null,
       xValues: null,
       seriesCache: null,
-      numericColumns: null,
       chartLogScale: false,
       chartYLocked: false,
     };
@@ -520,14 +487,17 @@
     function buildConfigFromState() {
       if (state.headers.length === 0) return null;
       const cfg = {};
-      const visibleNames = state.headers.filter((h, i) => state.visible[i]);
-      if (visibleNames.length === state.headers.length) cfg.cols = "all";
+      const visibleNames = activeSeriesColumns();
+      if (visibleNames.length === state.metricsByColumn.size) cfg.cols = "all";
       else if (visibleNames.length === 0) cfg.cols = "none";
       else cfg.cols = visibleNames;
       if (state.logScale) cfg.log = true;
-      if (state.showAllRows) cfg.allRows = true;
       if (state.selectedRowIndex > 0) cfg.row = state.selectedRowIndex;
-      if (state.searchQuery) cfg.q = state.searchQuery;
+      if (state.enabledCategories.size !== CATEGORIES.length) {
+        cfg.categories = [...state.enabledCategories];
+      }
+      if (state.enabledMetrics.size > 0) cfg.metrics = [...state.enabledMetrics];
+      if (state.focusedObjectIds.size > 0) cfg.objects = [...state.focusedObjectIds];
       if (state.yMin != null) cfg.ymin = state.yMin;
       if (state.yMax != null) cfg.ymax = state.yMax;
       if (hasXZoom()) {
@@ -613,7 +583,6 @@
     const clearSaved = document.getElementById("clearSaved");
     const dropHint = document.getElementById("dropHint");
     const logScaleEl = document.getElementById("logScale");
-    const showAllRowsEl = document.getElementById("showAllRows");
     const chartWrap = document.getElementById("chartWrap");
     const chartHost = document.getElementById("chartHost");
     const chartEmpty = document.getElementById("chartEmpty");
@@ -633,20 +602,14 @@
     const nextRow = document.getElementById("nextRow");
     const rowLabel = document.getElementById("rowLabel");
     const statusEl = document.getElementById("status");
-    const columnSearch = document.getElementById("columnSearch");
-    const selectAllBtn = document.getElementById("selectAll");
-    const selectNoneBtn = document.getElementById("selectNone");
-    const columnList = document.getElementById("columnList");
-    const wordGroupsEl = document.getElementById("wordGroups");
-    const wordGroupsList = document.getElementById("wordGroupsList");
-    const tableWrap = document.getElementById("tableWrap");
-    const emptyState = document.getElementById("emptyState");
-    const dataTable = document.getElementById("dataTable");
-    const tableHead = document.getElementById("tableHead");
-    const tableBody = document.getElementById("tableBody");
-    const detailPanel = document.getElementById("detailPanel");
-    const detailTitle = document.getElementById("detailTitle");
-    const detailGrid = document.getElementById("detailGrid");
+    const presetButtons = document.getElementById("presetButtons");
+    const topologyList = document.getElementById("topologyList");
+    const categoryToggles = document.getElementById("categoryToggles");
+    const metricToggles = document.getElementById("metricToggles");
+    const objectToggles = document.getElementById("objectToggles");
+    const inspectorPanel = document.getElementById("inspectorPanel");
+    const inspectorTitle = document.getElementById("inspectorTitle");
+    const inspectorGrid = document.getElementById("inspectorGrid");
 
     function parseCsvLine(line) {
       const fields = [];
@@ -683,59 +646,97 @@
       return fields;
     }
 
-    function parseCsv(text) {
-      const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-      const nonEmpty = lines.filter((l) => l.length > 0);
-      if (nonEmpty.length === 0) return { headers: [], rows: [] };
-      const headers = parseCsvLine(nonEmpty[0]);
-      const colCount = headers.length;
-      const rows = [];
-      for (let r = 1; r < nonEmpty.length; r++) {
-        const cells = parseCsvLine(nonEmpty[r]);
-        while (cells.length < colCount) cells.push("");
-        if (cells.length > colCount) cells.length = colCount;
-        rows.push(cells);
+    function parsePiperLog(text) {
+      const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").filter((l) => l.length > 0);
+      if (lines.length < 3) throw new Error("Not a Piper telemetry log");
+      if (lines[0] !== "# piper-telemetry-log-v1") throw new Error("Missing telemetry version line");
+      if (!lines[1].startsWith("# manifest ")) throw new Error("Missing manifest line");
+      const manifest = JSON.parse(lines[1].slice("# manifest ".length));
+      const headers = parseCsvLine(lines[2]);
+      const sampleCount = lines.length - 3;
+      const columnData = new Map();
+      for (const header of headers) {
+        columnData.set(header, { numeric: null, values: new Array(sampleCount) });
       }
-      return { headers, rows };
+      for (let r = 0; r < sampleCount; r++) {
+        const cells = parseCsvLine(lines[3 + r]);
+        for (let c = 0; c < headers.length; c++) {
+          const header = headers[c];
+          const raw = cells[c] ?? "";
+          const col = columnData.get(header);
+          if (header === "elapsed_ms") {
+            col.numeric = true;
+            col.values[r] = Number(raw);
+            continue;
+          }
+          const n = Number(raw);
+          if (col.numeric !== false && Number.isFinite(n) && raw !== "") {
+            col.numeric = true;
+            col.values[r] = n;
+          } else {
+            col.numeric = false;
+            col.values[r] = raw;
+          }
+        }
+      }
+      const metricsByColumn = new Map();
+      for (const metric of manifest.metrics || []) {
+        metricsByColumn.set(metric.column, metric);
+      }
+      return { manifest, headers, columnData, metricsByColumn, sampleCount };
     }
 
-    function isNumericColumn(ci) {
-      const name = state.headers[ci];
-      if (name === "elapsed_ms") return false;
-      if (/_name$|_state$|_scaling_state$|_probe_state$|_outcome$/.test(name)) return false;
-      if (/^(shutdown_requested|abort_requested|pending_scale_operation|anchor_name)$/.test(name)) return false;
-      if (/^stage\d+_is_anchor$/.test(name)) return false;
-      for (const row of state.rows) {
-        const n = Number(row[ci]);
-        if (Number.isFinite(n)) return true;
-      }
-      return false;
+    function metricIsPlottable(metric) {
+      if (!metric || metric.column === "elapsed_ms") return false;
+      if (metric.unit) return true;
+      if (/_state$|_outcome$|_reason$|_trend$/.test(metric.metric)) return false;
+      if (/requested|pressure|backpressure|operation$/.test(metric.metric)) return false;
+      const col = state.columnData.get(metric.column);
+      return col?.numeric === true;
     }
 
-    function defaultVisible() {
-      const picked = state.numericColumns.slice();
-      if (picked.some(Boolean)) return picked;
-      return state.headers.map(() => true);
+    function objectLabel(objectId) {
+      if (!state.manifest) return objectId;
+      if (objectId === "pipeline") return "Pipeline";
+      const link = (state.manifest.links || []).find((entry) => entry.id === objectId);
+      if (link) return link.label;
+      const stage = (state.manifest.stages || []).find((entry) => entry.id === objectId);
+      if (stage) return stage.name;
+      const anchor = (state.manifest.anchors || []).find((entry) => entry.id === objectId);
+      if (anchor) return anchor.name;
+      return objectId;
+    }
+
+    function seriesLabel(column) {
+      const metric = state.metricsByColumn.get(column);
+      if (!metric) return column;
+      const object = objectLabel(metric.object_id);
+      return `${object} · ${metric.label}`;
+    }
+
+    function columnMatchesFilters(column) {
+      const metric = state.metricsByColumn.get(column);
+      if (!metric || !metricIsPlottable(metric)) return false;
+      if (!state.enabledCategories.has(metric.category)) return false;
+      if (state.enabledMetrics.has("__none__")) return false;
+      if (state.enabledMetrics.size > 0 && !state.enabledMetrics.has(metric.metric)) return false;
+      if (state.focusedObjectIds.size > 0 && !state.focusedObjectIds.has(metric.object_id)) return false;
+      return true;
+    }
+
+    function activeSeriesColumns() {
+      return [...state.metricsByColumn.keys()].filter((column) => columnMatchesFilters(column));
     }
 
     function buildDataCaches() {
-      const n = state.rows.length;
-      const xi = xAxisIndex();
-      state.xValues = new Array(n);
-      if (xi >= 0) {
-        for (let i = 0; i < n; i++) state.xValues[i] = Number(state.rows[i][xi]);
-      } else {
-        for (let i = 0; i < n; i++) state.xValues[i] = i;
-      }
+      const n = state.sampleCount;
+      const elapsed = state.columnData.get("elapsed_ms");
+      state.xValues = elapsed?.values ? elapsed.values.slice() : new Array(n).fill(0).map((_, i) => i);
       state.seriesCache = new Map();
-      for (let ci = 0; ci < state.headers.length; ci++) {
-        if (!state.numericColumns[ci]) continue;
-        const arr = new Array(n);
-        for (let i = 0; i < n; i++) {
-          const num = Number(state.rows[i][ci]);
-          arr[i] = Number.isFinite(num) ? num : null;
-        }
-        state.seriesCache.set(ci, arr);
+      for (const column of activeSeriesColumns()) {
+        const col = state.columnData.get(column);
+        if (!col?.numeric) continue;
+        state.seriesCache.set(column, col.values.slice());
       }
     }
 
@@ -747,7 +748,7 @@
 
     function buildChartData(series) {
       const data = [state.xValues];
-      for (const ci of series) data.push(state.seriesCache.get(ci));
+      for (const column of series) data.push(state.seriesCache.get(column));
       return data;
     }
 
@@ -780,14 +781,6 @@
           state.logScale = cfg.log;
           logScaleEl.checked = cfg.log;
         }
-        if (cfg.allRows != null) {
-          state.showAllRows = cfg.allRows;
-          showAllRowsEl.checked = cfg.allRows;
-        }
-        if (cfg.q != null) {
-          state.searchQuery = cfg.q;
-          columnSearch.value = cfg.q;
-        }
         if (cfg.ymin != null || cfg.ymax != null) {
           state.yMin = cfg.ymin ?? null;
           state.yMax = cfg.ymax ?? null;
@@ -803,25 +796,27 @@
       if (!cfg || state.headers.length === 0) return;
       storageApplyDepth++;
       try {
-        if (cfg.cols === "all") {
-          state.visible = state.headers.map(() => true);
-        } else if (cfg.cols === "none") {
-          state.visible = state.headers.map(() => false);
+        if (cfg.categories) {
+          state.enabledCategories = new Set(cfg.categories);
+        }
+        if (cfg.metrics) {
+          state.enabledMetrics = new Set(cfg.metrics);
+        }
+        if (cfg.objects) {
+          state.focusedObjectIds = new Set(cfg.objects);
+        }
+        if (cfg.cols === "none") {
+          state.enabledMetrics = new Set(["__none__"]);
         } else if (Array.isArray(cfg.cols)) {
-          const set = new Set(cfg.cols);
-          state.visible = state.headers.map((h) => set.has(h));
+          state.enabledMetrics = new Set(
+            cfg.cols
+              .map((column) => state.metricsByColumn.get(column)?.metric)
+              .filter(Boolean)
+          );
         }
         if (cfg.log != null) {
           state.logScale = cfg.log;
           logScaleEl.checked = cfg.log;
-        }
-        if (cfg.allRows != null) {
-          state.showAllRows = cfg.allRows;
-          showAllRowsEl.checked = cfg.allRows;
-        }
-        if (cfg.q != null) {
-          state.searchQuery = cfg.q;
-          columnSearch.value = cfg.q;
         }
         if (cfg.ymin != null || cfg.ymax != null) {
           state.yMin = cfg.ymin ?? null;
@@ -834,10 +829,9 @@
           state.xZoomMin = cfg.xmin;
           state.xZoomMax = cfg.xmax;
         }
-        syncColumnCheckboxes();
-        applyColumnFilter();
-        if (cfg.row != null && state.rows.length > 0) {
-          const ri = Math.max(0, Math.min(cfg.row, state.rows.length - 1));
+        buildDashboard();
+        if (cfg.row != null && state.sampleCount > 0) {
+          const ri = Math.max(0, Math.min(cfg.row, state.sampleCount - 1));
           state.selectedRowIndex = ri;
           rowSlider.value = String(ri);
         }
@@ -978,17 +972,186 @@
       tryNext(0);
     }
 
+    function uniqueMetrics() {
+      const metrics = new Set();
+      for (const entry of state.metricsByColumn.values()) {
+        if (metricIsPlottable(entry)) metrics.add(entry.metric);
+      }
+      return [...metrics].sort();
+    }
+
+    function uniqueObjects() {
+      const objects = new Map();
+      for (const entry of state.metricsByColumn.values()) {
+        if (metricIsPlottable(entry)) objects.set(entry.object_id, entry.object_kind);
+      }
+      return [...objects.entries()].sort((a, b) => objectLabel(a[0]).localeCompare(objectLabel(b[0])));
+    }
+
+    function applyPreset(name) {
+      const metrics = PRESETS[name];
+      if (!metrics) return;
+      state.enabledMetrics = new Set(metrics);
+      state.focusedObjectIds.clear();
+      buildDashboard();
+      renderAll();
+      scheduleStorageSave();
+    }
+
+    function buildDashboard() {
+      presetButtons.replaceChildren();
+      for (const name of Object.keys(PRESETS)) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = name;
+        btn.addEventListener("click", () => applyPreset(name));
+        presetButtons.appendChild(btn);
+      }
+
+      topologyList.replaceChildren();
+      for (const link of state.manifest?.links || []) {
+        const row = document.createElement("label");
+        row.className = "dash-row";
+        row.dataset.objectId = link.id;
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = state.focusedObjectIds.has(link.id);
+        const span = document.createElement("span");
+        span.textContent = `Link: ${link.label}`;
+        row.append(cb, span);
+        row.addEventListener("click", (e) => {
+          if (e.target === cb) return;
+          cb.checked = !cb.checked;
+          cb.dispatchEvent(new Event("change"));
+        });
+        cb.addEventListener("change", () => {
+          if (cb.checked) state.focusedObjectIds.add(link.id);
+          else state.focusedObjectIds.delete(link.id);
+          row.classList.toggle("focused", cb.checked);
+          if (cb.checked) {
+            state.enabledMetrics.add("arrival_rate");
+            state.enabledMetrics.add("drain_rate");
+            state.enabledMetrics.add("len");
+          }
+          buildMetricToggles();
+          renderAll();
+          scheduleStorageSave();
+        });
+        row.classList.toggle("focused", cb.checked);
+        topologyList.appendChild(row);
+      }
+      for (const stage of state.manifest?.stages || []) {
+        const row = document.createElement("label");
+        row.className = "dash-row";
+        row.dataset.objectId = stage.id;
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = state.focusedObjectIds.has(stage.id);
+        const span = document.createElement("span");
+        span.textContent = `Stage: ${stage.name}`;
+        row.append(cb, span);
+        row.addEventListener("click", (e) => {
+          if (e.target === cb) return;
+          cb.checked = !cb.checked;
+          cb.dispatchEvent(new Event("change"));
+        });
+        cb.addEventListener("change", () => {
+          if (cb.checked) state.focusedObjectIds.add(stage.id);
+          else state.focusedObjectIds.delete(stage.id);
+          row.classList.toggle("focused", cb.checked);
+          renderAll();
+          scheduleStorageSave();
+        });
+        row.classList.toggle("focused", cb.checked);
+        topologyList.appendChild(row);
+      }
+
+      categoryToggles.replaceChildren();
+      for (const category of CATEGORIES) {
+        const row = document.createElement("label");
+        row.className = "dash-row";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = state.enabledCategories.has(category);
+        const span = document.createElement("span");
+        span.textContent = category;
+        row.append(cb, span);
+        cb.addEventListener("change", () => {
+          if (cb.checked) state.enabledCategories.add(category);
+          else state.enabledCategories.delete(category);
+          renderAll();
+          scheduleStorageSave();
+        });
+        categoryToggles.appendChild(row);
+      }
+
+      buildMetricToggles();
+      buildObjectToggles();
+    }
+
+    function buildMetricToggles() {
+      metricToggles.replaceChildren();
+      for (const metric of uniqueMetrics()) {
+        const row = document.createElement("label");
+        row.className = "dash-row";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = state.enabledMetrics.size === 0 || state.enabledMetrics.has(metric);
+        const span = document.createElement("span");
+        span.textContent = metric.replaceAll("_", " ");
+        row.append(cb, span);
+        cb.addEventListener("change", () => {
+          if (state.enabledMetrics.size === 0) {
+            state.enabledMetrics = new Set(uniqueMetrics());
+          }
+          if (cb.checked) state.enabledMetrics.add(metric);
+          else state.enabledMetrics.delete(metric);
+          renderAll();
+          scheduleStorageSave();
+        });
+        metricToggles.appendChild(row);
+      }
+    }
+
+    function buildObjectToggles() {
+      objectToggles.replaceChildren();
+      for (const [objectId] of uniqueObjects()) {
+        const row = document.createElement("label");
+        row.className = "dash-row";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = state.focusedObjectIds.size === 0 || state.focusedObjectIds.has(objectId);
+        const span = document.createElement("span");
+        span.textContent = objectLabel(objectId);
+        row.append(cb, span);
+        cb.addEventListener("change", () => {
+          if (state.focusedObjectIds.size === 0) {
+            state.focusedObjectIds = new Set(uniqueObjects().map(([id]) => id));
+          }
+          if (cb.checked) state.focusedObjectIds.add(objectId);
+          else state.focusedObjectIds.delete(objectId);
+          renderAll();
+          scheduleStorageSave();
+        });
+        objectToggles.appendChild(row);
+      }
+    }
+
     function loadCsvText(text, name, savedConfig) {
-      const { headers, rows } = parseCsv(text);
-      state.headers = headers;
-      state.rows = rows;
-      const pathLabel = (name || "").trim() || state.csvPath || "saved.csv";
+      const parsed = parsePiperLog(text);
+      state.manifest = parsed.manifest;
+      state.headers = parsed.headers;
+      state.columnData = parsed.columnData;
+      state.metricsByColumn = parsed.metricsByColumn;
+      state.sampleCount = parsed.sampleCount;
+      const pathLabel = (name || "").trim() || state.csvPath || "saved.piper.csv";
       state.csvPath = pathLabel;
       csvPathInput.value = pathLabel;
-      state.numericColumns = state.headers.map((_, i) => isNumericColumn(i));
+      state.enabledCategories = new Set(CATEGORIES);
+      state.enabledMetrics = new Set(["arrival_rate", "drain_rate", "len", "busy_ratio"]);
+      state.focusedObjectIds = new Set();
       buildDataCaches();
-      state.visible = defaultVisible();
-      state.selectedRowIndex = rows.length > 0 ? 0 : -1;
+      state.selectedRowIndex = state.sampleCount > 0 ? 0 : -1;
       state.yMin = null;
       state.yMax = null;
       state.xZoomMin = null;
@@ -998,15 +1161,13 @@
       yRangeHint.textContent = "";
       refreshFullXExtents();
       updateXZoomUi();
-      let status = `${pathLabel}: ${rows.length} rows, ${headers.length} columns`;
+      let status = `${pathLabel}: ${state.sampleCount} samples, ${state.headers.length} columns`;
       if (!isFullFilesystemPath(pathLabel)) {
         status += " — Enter a full path to auto-reload after page refresh.";
       }
       statusEl.textContent = status;
       enableControls(true);
-      buildWordGroups();
-      buildWordGroupPanel();
-      buildColumnList();
+      buildDashboard();
       if (savedConfig) applySavedConfig(savedConfig);
       else renderAll();
       updateFileLabel();
@@ -1015,9 +1176,9 @@
     }
 
     function renderAll() {
+      buildDataCaches();
       renderChartSafely();
-      renderTable();
-      renderDetail();
+      renderInspector();
       updateRowControls();
     }
 
@@ -1031,17 +1192,9 @@
       chartLegend.replaceChildren();
     }
 
-    function xAxisIndex() {
-      return state.headers.indexOf("elapsed_ms");
-    }
-
     function getXValues() {
       if (state.xValues) return state.xValues;
-      const xi = xAxisIndex();
-      if (xi >= 0) {
-        return state.rows.map((r) => Number(r[xi]));
-      }
-      return state.rows.map((_, i) => i);
+      return new Array(state.sampleCount).fill(0).map((_, i) => i);
     }
 
     function refreshFullXExtents() {
@@ -1067,7 +1220,7 @@
 
     function updateXZoomUi() {
       if (!hasXZoom()) {
-        xZoomReset.disabled = state.rows.length === 0;
+        xZoomReset.disabled = state.sampleCount === 0;
         xZoomHint.textContent = "";
         return;
       }
@@ -1119,15 +1272,10 @@
       scheduleStorageSave();
     }
 
-    function chartSeriesIndices() {
-      const xi = xAxisIndex();
-      return visibleColumnIndices().filter((ci) => ci !== xi && state.numericColumns[ci]);
-    }
-
     function plottedValueExtents() {
-      const series = chartSeriesIndices();
+      const series = activeSeriesColumns();
       let start = 0;
-      let end = state.rows.length;
+      let end = state.sampleCount;
       if (!hasYRangeLock() && hasXZoom()) {
         const range = rowIndexRangeForXRange(state.xZoomMin, state.xZoomMax);
         start = range.start;
@@ -1135,22 +1283,14 @@
       }
       let min = Infinity;
       let max = -Infinity;
-      for (const ci of series) {
-        const cached = state.seriesCache?.get(ci);
-        if (cached) {
-          for (let i = start; i < end; i++) {
-            const n = cached[i];
-            if (n == null || !Number.isFinite(n)) continue;
-            if (n < min) min = n;
-            if (n > max) max = n;
-          }
-        } else {
-          for (let i = start; i < end; i++) {
-            const n = Number(state.rows[i][ci]);
-            if (!Number.isFinite(n)) continue;
-            if (n < min) min = n;
-            if (n > max) max = n;
-          }
+      for (const column of series) {
+        const cached = state.seriesCache?.get(column);
+        if (!cached) continue;
+        for (let i = start; i < end; i++) {
+          const n = cached[i];
+          if (n == null || !Number.isFinite(n)) continue;
+          if (n < min) min = n;
+          if (n > max) max = n;
         }
       }
       if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
@@ -1291,7 +1431,7 @@
         yRangeHint.textContent = "Log scale requires Y min > 0.";
         return false;
       }
-      if (state.plot && chartSeriesIndices().length > 0) {
+      if (state.plot && activeSeriesColumns().length > 0) {
         applyYRangeToPlot();
       } else {
         renderChartSafely();
@@ -1314,7 +1454,7 @@
     function updateChartSeriesHint(plotSi, hover) {
       if (!state.plot) return;
       if (plotSi != null && plotSi > 0) {
-        const name = state.plot.series[plotSi].label || state.headers[state.chartSeriesCols[plotSi - 1]];
+        const name = state.plot.series[plotSi].label || seriesLabel(state.chartSeriesCols[plotSi - 1]);
         chartSeriesHint.textContent = hover ? `Nearest: ${name}` : `Series: ${name}`;
         return;
       }
@@ -1391,7 +1531,7 @@
 
     function renderChartLegend(series) {
       chartLegend.replaceChildren();
-      series.forEach((ci, si) => {
+      series.forEach((column, si) => {
         const item = document.createElement("span");
         item.className = "legend-item";
         if (state.pickedPlotSeries === si + 1) item.classList.add("picked");
@@ -1400,7 +1540,7 @@
         sw.className = "legend-swatch";
         sw.style.background = CHART_COLORS[si % CHART_COLORS.length];
         const label = document.createElement("span");
-        label.textContent = state.headers[ci];
+        label.textContent = seriesLabel(column);
         item.append(sw, label);
         item.addEventListener("click", () => {
           if (!state.plot) return;
@@ -1413,13 +1553,13 @@
     }
 
     function renderChart() {
-      if (state.rows.length === 0) {
+      if (state.sampleCount === 0) {
         destroyChart();
         chartEmpty.hidden = false;
-        chartEmpty.textContent = "Load CSV and select numeric columns to graph.";
+        chartEmpty.textContent = "Load a Piper telemetry log and enable metrics to graph.";
         return;
       }
-      const series = chartSeriesIndices();
+      const series = activeSeriesColumns();
       const hasSeries = series.length > 0;
       if (!hasSeries) {
         destroyChart();
@@ -1431,7 +1571,7 @@
       if (typeof uPlot === "undefined") {
         destroyChart();
         chartEmpty.hidden = false;
-        chartEmpty.textContent = "Chart library unavailable. CSV table loaded below.";
+        chartEmpty.textContent = "Chart library unavailable.";
         return;
       }
 
@@ -1469,9 +1609,9 @@
       chartSeriesHint.textContent = "Click a line to identify";
 
       const seriesOpts = [{}];
-      series.forEach((ci, si) => {
+      series.forEach((column, si) => {
         seriesOpts.push({
-          label: state.headers[ci],
+          label: seriesLabel(column),
           stroke: CHART_COLORS[si % CHART_COLORS.length],
           width: 2,
           auto: !yLocked,
@@ -1548,12 +1688,7 @@
               state.selectedRowIndex = idx;
               rowSlider.value = String(idx);
               updateRowControls();
-              if (state.showAllRows && tableBody.childElementCount > 0) {
-                updateTableSelection(prev, idx);
-              } else {
-                renderTable();
-              }
-              renderDetail();
+              renderInspector();
               scheduleStorageSave();
             },
           ],
@@ -1585,7 +1720,7 @@
         destroyChart();
         chartEmpty.hidden = false;
         const message = error?.message || String(error);
-        chartEmpty.textContent = `Chart unavailable: ${message}. CSV table loaded below.`;
+        chartEmpty.textContent = `Chart unavailable: ${message}.`;
       }
     }
 
@@ -1604,22 +1739,16 @@
     }
 
     function enableControls(on) {
-      columnSearch.disabled = !on;
-      selectAllBtn.disabled = !on;
-      selectNoneBtn.disabled = !on;
-      const hasRows = on && state.rows.length > 0;
+      const hasRows = on && state.sampleCount > 0;
       rowSlider.disabled = !hasRows;
       prevRow.disabled = !hasRows;
       nextRow.disabled = !hasRows;
       if (hasRows) {
-        rowSlider.max = String(state.rows.length - 1);
+        rowSlider.max = String(state.sampleCount - 1);
         rowSlider.value = String(Math.max(0, state.selectedRowIndex));
       }
-      emptyState.hidden = on;
-      dataTable.hidden = !on;
-      detailPanel.hidden = !on || state.rows.length === 0;
+      inspectorPanel.hidden = !on || state.sampleCount === 0;
       chartSection.hidden = !on;
-      wordGroupsEl.hidden = !on;
       yMinOverride.disabled = !on;
       yMaxOverride.disabled = !on;
       yRangeFromData.disabled = !on;
@@ -1629,225 +1758,59 @@
       if (!on) xZoomHint.textContent = "";
     }
 
-    function visibleColumnIndices() {
-      const out = [];
-      for (let i = 0; i < state.headers.length; i++) {
-        if (state.visible[i]) out.push(i);
-      }
-      return out;
-    }
-
-    function columnTokens(name) {
-      return name.split("_").filter(Boolean);
-    }
-
-    function buildWordGroups() {
-      const map = new Map();
-      state.headers.forEach((name, i) => {
-        for (const tok of columnTokens(name)) {
-          if (!map.has(tok)) map.set(tok, []);
-          const arr = map.get(tok);
-          if (!arr.includes(i)) arr.push(i);
+    function inspectorColumns() {
+      const columns = new Set(["elapsed_ms"]);
+      for (const column of activeSeriesColumns()) columns.add(column);
+      if (state.focusedObjectIds.size > 0) {
+        for (const [column, metric] of state.metricsByColumn.entries()) {
+          if (state.focusedObjectIds.has(metric.object_id)) columns.add(column);
         }
-      });
-      state.wordGroups = [...map.entries()].sort(
-        (a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0])
-      );
-    }
-
-    function syncColumnCheckboxes() {
-      columnList.querySelectorAll(".column-item").forEach((el) => {
-        const i = Number(el.dataset.index);
-        const cb = el.querySelector('input[type="checkbox"]');
-        if (cb) cb.checked = state.visible[i];
-      });
-    }
-
-    function setColumnsVisible(indices, on) {
-      for (const i of indices) state.visible[i] = on;
-      syncColumnCheckboxes();
-      renderAll();
-      scheduleStorageSave();
-    }
-
-    function buildWordGroupPanel() {
-      wordGroupsList.replaceChildren();
-      for (const [word, indices] of state.wordGroups) {
-        const row = document.createElement("div");
-        row.className = "word-group-row";
-        row.dataset.word = word;
-        row.dataset.indices = indices.join(",");
-        const label = document.createElement("span");
-        label.className = "word-group-label";
-        label.textContent = word;
-        const count = document.createElement("span");
-        count.className = "word-group-count";
-        count.textContent = `(${indices.length})`;
-        const actions = document.createElement("div");
-        actions.className = "word-group-actions";
-        const allBtn = document.createElement("button");
-        allBtn.type = "button";
-        allBtn.className = "mini-btn";
-        allBtn.textContent = "All";
-        allBtn.addEventListener("click", () => setColumnsVisible(indices, true));
-        const noneBtn = document.createElement("button");
-        noneBtn.type = "button";
-        noneBtn.className = "mini-btn";
-        noneBtn.textContent = "None";
-        noneBtn.addEventListener("click", () => setColumnsVisible(indices, false));
-        actions.append(allBtn, noneBtn);
-        row.append(label, count, actions);
-        wordGroupsList.appendChild(row);
       }
-      applyColumnFilter();
+      return [...columns];
     }
 
-    function buildColumnList() {
-      columnList.replaceChildren();
-      state.headers.forEach((name, i) => {
-        const item = document.createElement("label");
-        item.className = "column-item";
-        item.dataset.index = String(i);
-        const cb = document.createElement("input");
-        cb.type = "checkbox";
-        cb.checked = state.visible[i];
-        if (!state.numericColumns[i]) item.style.opacity = "0.55";
-        cb.addEventListener("change", () => {
-          state.visible[i] = cb.checked;
-          renderAll();
-          scheduleStorageSave();
-        });
-        const span = document.createElement("span");
-        span.textContent = name;
-        item.append(cb, span);
-        item.addEventListener("click", (e) => {
-          if (e.target === cb) return;
-          cb.checked = !cb.checked;
-          state.visible[i] = cb.checked;
-          renderAll();
-          scheduleStorageSave();
-        });
-        columnList.appendChild(item);
-      });
-      applyColumnFilter();
-    }
-
-    let filterDebounce = null;
-    function columnMatchesSearch(ci, q) {
-      if (!q.length) return true;
-      return (state.headers[ci] || "").toLowerCase().includes(q);
-    }
-
-    function applyColumnFilter() {
-      const q = state.searchQuery.toLowerCase();
-      columnList.querySelectorAll(".column-item").forEach((el) => {
-        const i = Number(el.dataset.index);
-        el.classList.toggle("hidden-filter", !columnMatchesSearch(i, q));
-      });
-      wordGroupsList.querySelectorAll(".word-group-row").forEach((el) => {
-        const indices = el.dataset.indices.split(",").map(Number).filter((n) => !Number.isNaN(n));
-        const anyMatch = q.length === 0 || indices.some((i) => columnMatchesSearch(i, q));
-        el.classList.toggle("hidden-filter", !anyMatch);
-      });
-    }
-
-    function renderTable() {
-      const cols = visibleColumnIndices();
-      tableHead.replaceChildren();
-      tableBody.replaceChildren();
-      if (cols.length === 0) {
-        const tr = document.createElement("tr");
-        const th = document.createElement("th");
-        th.textContent = "Select at least one column";
-        tr.appendChild(th);
-        tableHead.appendChild(tr);
-        return;
-      }
-      const headRow = document.createElement("tr");
-      for (const ci of cols) {
-        const th = document.createElement("th");
-        th.textContent = state.headers[ci];
-        headRow.appendChild(th);
-      }
-      tableHead.appendChild(headRow);
-
-      const rowsToShow = state.showAllRows
-        ? state.rows.map((_, i) => i)
-        : state.selectedRowIndex >= 0
-          ? [state.selectedRowIndex]
-          : [];
-
-      for (const ri of rowsToShow) {
-        const tr = document.createElement("tr");
-        if (ri === state.selectedRowIndex) tr.classList.add("selected");
-        tr.dataset.rowIndex = String(ri);
-        for (const ci of cols) {
-          const td = document.createElement("td");
-          td.textContent = state.rows[ri][ci] ?? "";
-          tr.appendChild(td);
-        }
-        tr.addEventListener("click", () => selectRow(ri));
-        tableBody.appendChild(tr);
-      }
-    }
-
-    function updateTableSelection(prevIdx, nextIdx) {
-      if (prevIdx >= 0) {
-        const prev = tableBody.querySelector(`tr[data-row-index="${prevIdx}"]`);
-        if (prev) prev.classList.remove("selected");
-      }
-      if (nextIdx >= 0) {
-        const next = tableBody.querySelector(`tr[data-row-index="${nextIdx}"]`);
-        if (next) next.classList.add("selected");
-      }
-    }
-
-    function renderDetail() {
-      detailGrid.replaceChildren();
-      if (state.selectedRowIndex < 0 || state.rows.length === 0) return;
+    function renderInspector() {
+      inspectorGrid.replaceChildren();
+      if (state.selectedRowIndex < 0 || state.sampleCount === 0) return;
       const ri = state.selectedRowIndex;
-      detailTitle.textContent = `Row ${ri + 1} of ${state.rows.length}`;
-      const cols = visibleColumnIndices();
-      for (const ci of cols) {
+      const elapsed = state.columnData.get("elapsed_ms")?.values?.[ri];
+      inspectorTitle.textContent = elapsed != null
+        ? `Sample ${ri + 1} of ${state.sampleCount} · ${elapsed} ms`
+        : `Sample ${ri + 1} of ${state.sampleCount}`;
+      for (const column of inspectorColumns()) {
+        const col = state.columnData.get(column);
+        if (!col) continue;
         const pair = document.createElement("div");
         pair.className = "detail-pair";
         const dt = document.createElement("dt");
-        dt.textContent = state.headers[ci];
+        dt.textContent = seriesLabel(column);
         const dd = document.createElement("dd");
-        dd.textContent = state.rows[ri][ci] ?? "";
+        const value = col.values[ri];
+        dd.textContent = value == null ? "" : String(value);
         pair.append(dt, dd);
-        detailGrid.appendChild(pair);
+        inspectorGrid.appendChild(pair);
       }
     }
 
     function selectRow(index, opts = {}) {
-      if (index < 0 || index >= state.rows.length) return;
-      const prevIdx = state.selectedRowIndex;
+      if (index < 0 || index >= state.sampleCount) return;
       state.selectedRowIndex = index;
       rowSlider.value = String(index);
       updateRowControls();
-      if (opts.forceTableRebuild || tableBody.childElementCount === 0 || !state.showAllRows) {
-        renderTable();
-      } else {
-        updateTableSelection(prevIdx, index);
-      }
-      renderDetail();
+      renderInspector();
       if (!opts.fromChart) syncChartCursor();
-      const row = tableBody.querySelector(`tr[data-row-index="${index}"]`);
-      if (row) row.scrollIntoView({ block: "nearest" });
       scheduleStorageSave();
     }
 
     function updateRowControls() {
-      const n = state.rows.length;
+      const n = state.sampleCount;
       if (n === 0) {
         rowLabel.textContent = "—";
         return;
       }
       const i = state.selectedRowIndex;
-      const elapsed = state.headers.indexOf("elapsed_ms");
-      const ms = elapsed >= 0 ? state.rows[i][elapsed] : "";
-      rowLabel.textContent = ms ? `Row ${i + 1} · ${ms} ms` : `Row ${i + 1} / ${n}`;
+      const elapsed = state.columnData.get("elapsed_ms")?.values?.[i];
+      rowLabel.textContent = elapsed != null ? `Sample ${i + 1} · ${elapsed} ms` : `Sample ${i + 1} / ${n}`;
       prevRow.disabled = i <= 0;
       nextRow.disabled = i >= n - 1;
     }
@@ -1939,12 +1902,6 @@
       });
     });
 
-    showAllRowsEl.addEventListener("change", () => {
-      state.showAllRows = showAllRowsEl.checked;
-      renderTable();
-      scheduleStorageSave();
-    });
-
     let resizeDebounce = null;
     const resizeObserver = new ResizeObserver(() => {
       clearTimeout(resizeDebounce);
@@ -1958,31 +1915,15 @@
     prevRow.addEventListener("click", () => selectRow(state.selectedRowIndex - 1));
     nextRow.addEventListener("click", () => selectRow(state.selectedRowIndex + 1));
 
-    columnSearch.addEventListener("input", () => {
-      state.searchQuery = columnSearch.value;
-      clearTimeout(filterDebounce);
-      filterDebounce = setTimeout(() => {
-        applyColumnFilter();
-        scheduleStorageSave();
-      }, 100);
-    });
-
-    selectAllBtn.addEventListener("click", () => {
-      setColumnsVisible(state.headers.map((_, i) => i), true);
-    });
-    selectNoneBtn.addEventListener("click", () => {
-      setColumnsVisible(state.headers.map((_, i) => i), false);
-    });
-
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape" && state.pickedPlotSeries) clearSeriesPick();
     });
 
-    tableWrap.addEventListener("keydown", (e) => {
-      if (state.rows.length === 0) return;
+    document.addEventListener("keydown", (e) => {
+      if (state.sampleCount === 0) return;
       if (e.key === "ArrowDown") {
         e.preventDefault();
-        selectRow(Math.min(state.selectedRowIndex + 1, state.rows.length - 1));
+        selectRow(Math.min(state.selectedRowIndex + 1, state.sampleCount - 1));
       } else if (e.key === "ArrowUp") {
         e.preventDefault();
         selectRow(Math.max(state.selectedRowIndex - 1, 0));

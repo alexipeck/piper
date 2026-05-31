@@ -1,5 +1,5 @@
 use piper::{
-    BufferLease, CsvTelemetryConfig, PiperConfig, Stage, StageContext, StageExt, anchor, pipeline,
+    BufferLease, PiperConfig, Stage, StageContext, StageExt, TelemetryLogConfig, anchor, pipeline,
     stage,
 };
 use std::sync::{
@@ -161,8 +161,8 @@ fn config() -> PiperConfig {
         poll_interval: Duration::from_millis(2),
         global_worker_cap: Some(max_parallelism().saturating_mul(2).max(4)),
         csv_telemetry: Some(
-            CsvTelemetryConfig::new(format!(
-                "piper_fork_join_{}.csv",
+            TelemetryLogConfig::new(format!(
+                "piper_fork_join_{}.piper.csv",
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()

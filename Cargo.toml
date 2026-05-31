@@ -20,6 +20,8 @@ crossbeam-channel = { version = "0.5.15", optional = true }
 parking_lot = "0.12.5"
 piper-macros = { path = "piper-macros" }
 rand = "0.10.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
 thiserror = "2.0.18"
 
 [[example]]
@@ -31,4 +33,5 @@ name = "scaling_pipeline_feeder"
 required-features = ["feeder"]
 
 [dev-dependencies]
+serde_json = "1.0.145"
 trybuild = "1.0.116"
