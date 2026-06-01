@@ -170,7 +170,9 @@ mod backend {
                         Err(TryRecvError::Empty)
                     }
                 }
-                Err(ReceiveError::Closed) | Err(ReceiveError::SendClosed) => Err(TryRecvError::Closed),
+                Err(ReceiveError::Closed) | Err(ReceiveError::SendClosed) => {
+                    Err(TryRecvError::Closed)
+                }
             }
         }
 
@@ -206,8 +208,7 @@ mod backend {
         }
 
         pub fn is_closed(&self) -> bool {
-            self.endpoints.is_closed()
-                || (self.endpoints.is_terminated() && self.inner.is_empty())
+            self.endpoints.is_closed() || (self.endpoints.is_terminated() && self.inner.is_empty())
         }
     }
 
@@ -316,8 +317,7 @@ mod backend {
         }
 
         pub fn is_closed(&self) -> bool {
-            self.endpoints.is_closed()
-                || (self.endpoints.is_terminated() && self.is_empty())
+            self.endpoints.is_closed() || (self.endpoints.is_terminated() && self.is_empty())
         }
     }
 
@@ -375,7 +375,10 @@ mod tests {
         assert_eq!(rx.recv().unwrap(), 1);
         assert!(rx.is_terminated());
         assert_eq!(rx.try_recv(), Err(TryRecvError::Closed));
-        assert_eq!(rx.recv_timeout(Duration::ZERO), Err(RecvTimeoutError::Closed));
+        assert_eq!(
+            rx.recv_timeout(Duration::ZERO),
+            Err(RecvTimeoutError::Closed)
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::process::Command;
 fn cargo_check(args: &[&str]) -> (bool, String) {
     let output = Command::new(env!("CARGO"))
         .arg("check")
+        .arg("--release")
         .args(args)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
@@ -14,7 +15,10 @@ fn cargo_check(args: &[&str]) -> (bool, String) {
 #[test]
 fn additive_kanal_feature_compiles() {
     let (ok, stderr) = cargo_check(&["--features", "channel-kanal"]);
-    assert!(ok, "expected compile with default + channel-kanal: {stderr}");
+    assert!(
+        ok,
+        "expected compile with default + channel-kanal: {stderr}"
+    );
 }
 
 #[test]
@@ -24,7 +28,10 @@ fn kanal_wins_when_both_features_enabled() {
         "--features",
         "channel-kanal,channel-crossbeam",
     ]);
-    assert!(ok, "kanal should take precedence when both are enabled: {stderr}");
+    assert!(
+        ok,
+        "kanal should take precedence when both are enabled: {stderr}"
+    );
 }
 
 #[test]

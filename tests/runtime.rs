@@ -1,6 +1,7 @@
 use piper::{
-    IntoStageSpec, PipelineGraph, PipelineGraphBuilder, Piper, PiperConfig, TelemetryLogConfig,
-    PiperError, Stage, StageContext, anchor, inline_stage, pipeline, stage,
+    IntoStageSpec, PipelineGraph, PipelineGraphBuilder, Piper, PiperConfig, PiperError,
+    SingleThreadWeightedBranchConfig, Stage, StageContext, TelemetryLogConfig, anchor,
+    inline_stage, pipeline, stage,
 };
 use std::fs;
 use std::sync::Arc;
@@ -458,10 +459,7 @@ fn read_telemetry_log(path: &std::path::Path) -> (serde_json::Value, Vec<String>
     assert!(lines[1].starts_with("# manifest "));
     let manifest: serde_json::Value =
         serde_json::from_str(lines[1].strip_prefix("# manifest ").unwrap()).unwrap();
-    let header = lines[2]
-        .split(',')
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    let header = lines[2].split(',').map(str::to_string).collect::<Vec<_>>();
     let samples = lines[3..]
         .iter()
         .filter(|line| !line.is_empty())
@@ -512,23 +510,32 @@ fn telemetry_log_writes_manifest_header_and_samples() {
     let (manifest, header, samples) = read_telemetry_log(&path);
     assert_eq!(manifest["format"], "piper-telemetry-log");
     assert_eq!(manifest["version"], 1);
-    assert!(manifest["stages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|stage| stage["name"] == "pass"));
+    assert!(
+        manifest["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|stage| stage["name"] == "pass")
+    );
     assert!(manifest["links"].as_array().unwrap().len() >= 2);
     let link = manifest["links"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|link| link["producers"].as_array().unwrap().contains(&serde_json::json!("input")))
+        .find(|link| {
+            link["producers"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("input"))
+        })
         .expect("input link");
-    assert!(link["consumers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|consumer| consumer.as_str() == Some("stage0")));
+    assert!(
+        link["consumers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|consumer| consumer.as_str() == Some("stage0"))
+    );
     assert!(!header.iter().any(|column| column == "stage0_name"));
     assert!(!header.iter().any(|column| column == "anchor_count"));
     assert!(header.contains(&"stage0_service_time_ms".to_string()));
@@ -584,36 +591,340 @@ fn telemetry_log_manifest_classifies_fork_and_join_links() {
         .find(|link| link["kind"] == "fork")
         .expect("fork link");
     assert_eq!(fork_link["producers"], serde_json::json!(["stage0"]));
-    assert!(fork_link["consumers"]
-        .as_array()
-        .unwrap()
-        .contains(&serde_json::json!("stage1")));
-    assert!(fork_link["consumers"]
-        .as_array()
-        .unwrap()
-        .contains(&serde_json::json!("stage2")));
+    assert!(
+        fork_link["consumers"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("stage1"))
+    );
+    assert!(
+        fork_link["consumers"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("stage2"))
+    );
     let join_link = links
         .iter()
         .find(|link| link["kind"] == "join")
         .expect("join link");
-    assert!(join_link["producers"]
-        .as_array()
-        .unwrap()
-        .contains(&serde_json::json!("stage1")));
-    assert!(join_link["producers"]
-        .as_array()
-        .unwrap()
-        .contains(&serde_json::json!("stage2")));
+    assert!(
+        join_link["producers"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("stage1"))
+    );
+    assert!(
+        join_link["producers"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("stage2"))
+    );
     assert_eq!(join_link["consumers"], serde_json::json!(["output"]));
     let _ = fs::remove_file(&path);
+}
+
+struct SlowCount {
+    count: Arc<AtomicUsize>,
+}
+
+impl Stage for SlowCount {
+    type Input = u32;
+    type Output = u32;
+    type Error = TestError;
+    type State = ();
+
+    fn init(&self) -> std::result::Result<Self::State, Self::Error> {
+        Ok(())
+    }
+
+    fn process(
+        &self,
+        _state: &mut Self::State,
+        input: Self::Input,
+        ctx: &mut StageContext<Self::Output, Self::Error>,
+    ) -> std::result::Result<(), Self::Error> {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(25));
+        ctx.emit(input);
+        Ok(())
+    }
+}
+
+fn weighted_branch_graph(
+    _left: Arc<AtomicUsize>,
+    _right: Arc<AtomicUsize>,
+    left_stage: impl IntoStageSpec<TestError, Input = u32, Output = u32>,
+    right_stage: impl IntoStageSpec<TestError, Input = u32, Output = u32>,
+) -> PipelineGraph<u32, u32, TestError> {
+    let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
+    let input = builder.input();
+    let branch_links = builder.add_single_thread_weighted_branch(
+        input,
+        "branch",
+        SingleThreadWeightedBranchConfig {
+            target_queue_seconds: 0.5,
+            ewma_half_life: Duration::from_millis(25),
+        },
+    );
+    let merged = builder.link();
+    builder.add_stage_to(branch_links.left, left_stage, merged);
+    builder.add_stage_to(branch_links.right, right_stage, merged);
+    let output = builder.add_stage(merged, stage("merge", Pass));
+    builder.finish(output)
+}
+
+#[test]
+fn weighted_branch_routes_each_input_exactly_once() {
+    let left = Arc::new(AtomicUsize::new(0));
+    let right = Arc::new(AtomicUsize::new(0));
+    let piper = Piper::<u32, u32, TestError>::start(
+        config(),
+        weighted_branch_graph(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            stage(
+                "left",
+                CountPass {
+                    count: Arc::clone(&left),
+                },
+            ),
+            stage(
+                "right",
+                CountPass {
+                    count: Arc::clone(&right),
+                },
+            ),
+        ),
+    )
+    .unwrap();
+
+    for value in 0..100 {
+        piper.sender().send(value).unwrap();
+    }
+    piper.shutdown();
+    for _ in 0..100 {
+        piper
+            .receiver()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+    }
+
+    assert_eq!(
+        left.load(Ordering::Relaxed) + right.load(Ordering::Relaxed),
+        100
+    );
+    piper.join().unwrap();
+}
+
+#[test]
+fn weighted_branch_routes_more_to_faster_downstream_after_backlog() {
+    let left = Arc::new(AtomicUsize::new(0));
+    let right = Arc::new(AtomicUsize::new(0));
+    let piper = Piper::<u32, u32, TestError>::start(
+        PiperConfig {
+            sample_interval: Duration::from_millis(2),
+            ..config()
+        },
+        weighted_branch_graph(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            stage(
+                "slow",
+                SlowCount {
+                    count: Arc::clone(&left),
+                },
+            ),
+            stage(
+                "fast",
+                CountPass {
+                    count: Arc::clone(&right),
+                },
+            ),
+        ),
+    )
+    .unwrap();
+
+    for value in 0..400 {
+        piper.sender().send(value).unwrap();
+        if value % 4 == 3 {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    piper.shutdown();
+    piper.join().unwrap();
+
+    let left_count = left.load(Ordering::Relaxed);
+    let right_count = right.load(Ordering::Relaxed);
+    assert_eq!(left_count + right_count, 400);
+    assert!(right_count > left_count);
+    assert!(right_count > left_count + left_count / 4);
+}
+
+#[test]
+fn weighted_branch_snapshot_reports_output_links() {
+    let left = Arc::new(AtomicUsize::new(0));
+    let right = Arc::new(AtomicUsize::new(0));
+    let piper = Piper::<u32, u32, TestError>::start(
+        config(),
+        weighted_branch_graph(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            stage(
+                "left",
+                CountPass {
+                    count: Arc::clone(&left),
+                },
+            ),
+            stage(
+                "right",
+                CountPass {
+                    count: Arc::clone(&right),
+                },
+            ),
+        ),
+    )
+    .unwrap();
+
+    std::thread::sleep(Duration::from_millis(20));
+    let telemetry = piper.get_telemetry();
+    let branch = telemetry
+        .stages
+        .iter()
+        .find(|stage| stage.name == "branch")
+        .expect("branch stage");
+    assert_eq!(branch.output_links.len(), 2);
+    assert_eq!(branch.output_link, branch.output_links[0]);
+    assert_eq!(branch.active_threads, 1);
+    assert_eq!(branch.desired_workers, 1);
+    assert!(!branch.is_anchor);
+    assert!(!branch.is_external);
+
+    let merge = telemetry
+        .stages
+        .iter()
+        .find(|stage| stage.name == "merge")
+        .expect("merge stage");
+    assert_eq!(merge.output_links.len(), 1);
+
+    piper.abort();
+    piper.join().unwrap();
+}
+
+fn weighted_branch_telemetry_graph() -> PipelineGraph<u32, u32, TestError> {
+    let left = Arc::new(AtomicUsize::new(0));
+    let right = Arc::new(AtomicUsize::new(0));
+    weighted_branch_graph(left, right, stage("left", Pass), stage("right", Pass))
+}
+
+#[test]
+fn weighted_branch_telemetry_manifest_lists_both_output_links() {
+    let path = std::env::temp_dir().join(format!(
+        "piper_weighted_branch_telemetry_{}_{}.piper.csv",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("runtime")
+    ));
+    let _ = fs::remove_file(&path);
+
+    let piper = Piper::<u32, u32, TestError>::start(
+        PiperConfig {
+            csv_telemetry: Some(TelemetryLogConfig::new(&path).interval(Duration::from_millis(5))),
+            ..config()
+        },
+        weighted_branch_telemetry_graph(),
+    )
+    .unwrap();
+    piper.sender().send(1).unwrap();
+    piper.shutdown();
+    piper.join().unwrap();
+
+    let (manifest, header, _) = read_telemetry_log(&path);
+    let branch = manifest["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stage| stage["name"] == "branch")
+        .expect("branch stage");
+    assert_eq!(branch["output_links"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        branch["output_link"],
+        branch["output_links"].as_array().unwrap()[0]
+    );
+
+    let links = manifest["links"].as_array().unwrap();
+    let left_link = links
+        .iter()
+        .find(|link| {
+            link["producers"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("stage0"))
+                && link["consumers"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("stage1"))
+        })
+        .expect("left branch output link");
+    let right_link = links
+        .iter()
+        .find(|link| {
+            link["producers"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("stage0"))
+                && link["consumers"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("stage2"))
+        })
+        .expect("right branch output link");
+    assert_ne!(left_link["id"], right_link["id"]);
+
+    assert!(header.iter().any(|column| column.starts_with("link")));
+    assert!(
+        !header
+            .iter()
+            .any(|column| column.contains("branch_internal"))
+    );
+    let _ = fs::remove_file(&path);
+}
+
+#[cfg(feature = "feeder")]
+#[test]
+fn weighted_branch_rejects_feeder_on_output_links() {
+    use piper::FeederLinkConfig;
+
+    let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
+    let input = builder.input();
+    let left = builder.link::<u32>();
+    let right = builder.link::<u32>();
+    builder.feeder_link(left, FeederLinkConfig::default());
+    builder.add_single_thread_weighted_branch_to(
+        input,
+        "branch",
+        left,
+        right,
+        SingleThreadWeightedBranchConfig::default(),
+    );
+    let merged = builder.link();
+    builder.add_stage_to(left, stage("left", Pass), merged);
+    builder.add_stage_to(right, stage("right", Pass), merged);
+    let output = builder.add_stage(merged, stage("merge", Pass));
+    let graph = builder.finish(output);
+
+    let Err(error) = Piper::<u32, u32, TestError>::start(config(), graph) else {
+        panic!("feeder output on weighted branch should fail");
+    };
+    assert!(matches!(
+        error,
+        PiperError::UnsupportedWeightedBranchFeederOutput { .. }
+    ));
 }
 
 #[cfg(feature = "feeder")]
 mod feeder_tests {
     use super::*;
-    use piper::{
-        FeederLinkConfig, RecvOutputError, TryRecvOutputError,
-    };
+    use piper::{FeederLinkConfig, RecvOutputError, TryRecvOutputError};
     use std::num::NonZeroUsize;
 
     fn feeder_config() -> FeederLinkConfig {
@@ -643,7 +954,8 @@ mod feeder_tests {
         builder.feeder_link(output, cfg);
         let external_token = builder.add_external_node_to::<u32, u32>(input, "external", output);
         let mut piper =
-            Piper::<u32, u32, TestError>::start(feeder_test_config(), builder.finish(output)).unwrap();
+            Piper::<u32, u32, TestError>::start(feeder_test_config(), builder.finish(output))
+                .unwrap();
         let external = piper.take_external_node(external_token);
 
         piper.sender().send(3).unwrap();
@@ -669,7 +981,8 @@ mod feeder_tests {
         builder.feeder_link(input, feeder_config());
         let external_token = builder.add_external_node_to::<u32, u32>(input, "external", output);
         let mut piper =
-            Piper::<u32, u32, TestError>::start(feeder_test_config(), builder.finish(output)).unwrap();
+            Piper::<u32, u32, TestError>::start(feeder_test_config(), builder.finish(output))
+                .unwrap();
         let external_a = piper.take_external_node(external_token);
         let external_b = external_a.clone();
 
@@ -733,7 +1046,8 @@ mod feeder_tests {
             output,
         );
         let mut piper =
-            Piper::<u32, u32, TestError>::start(feeder_test_config(), builder.finish(output)).unwrap();
+            Piper::<u32, u32, TestError>::start(feeder_test_config(), builder.finish(output))
+                .unwrap();
         let external = piper.take_external_node(external_token);
 
         piper.sender().send(5).unwrap();
@@ -759,7 +1073,8 @@ mod feeder_tests {
         builder.feeder_link(output, feeder_config());
         let external_token = builder.add_external_node_to::<u32, u32>(input, "external", output);
         let mut piper =
-            Piper::<u32, u32, TestError>::start(feeder_test_config(), builder.finish(output)).unwrap();
+            Piper::<u32, u32, TestError>::start(feeder_test_config(), builder.finish(output))
+                .unwrap();
         let external = piper.take_external_node(external_token);
         let receiver = piper.receiver();
 

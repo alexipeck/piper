@@ -1,6 +1,6 @@
 use piper::{
-    BufferLease, FeederLinkConfig, PipelineGraphBuilder, Piper, PiperConfig, TelemetryLogConfig,
-    Stage, StageContext, StageExt, anchor, stage,
+    BufferLease, FeederLinkConfig, PipelineGraphBuilder, Piper, PiperConfig, Stage, StageContext,
+    StageExt, TelemetryLogConfig, anchor, stage,
 };
 use std::io::{self, Write};
 use std::sync::{

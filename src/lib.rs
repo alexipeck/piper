@@ -7,14 +7,14 @@ use std::any::Any;
 #[cfg(feature = "feeder")]
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
-#[cfg(feature = "feeder")]
-use std::num::NonZeroUsize;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::marker::PhantomData;
+#[cfg(feature = "feeder")]
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -43,6 +43,12 @@ pub enum PiperError<E: Debug + Display = String> {
 
     #[error("anchor thread count must be greater than 0")]
     InvalidAnchorThreads,
+
+    #[error("invalid weighted branch `{branch}` config: {message}")]
+    InvalidWeightedBranchConfig { branch: String, message: String },
+
+    #[error("weighted branch `{branch}` output link {link} cannot use feeder")]
+    UnsupportedWeightedBranchFeederOutput { branch: String, link: usize },
 
     #[error("failed to spawn worker thread `{worker}`")]
     SpawnFailed {
@@ -287,6 +293,7 @@ pub struct StageSnapshot {
     pub name: String,
     pub input_link: usize,
     pub output_link: usize,
+    pub output_links: Vec<usize>,
     pub active_threads: usize,
     pub processed_count: u64,
     pub busy_ratio: f64,
@@ -1511,13 +1518,10 @@ impl LinkReceiver {
                 receiver.recv().map_err(|_| LinkRecvError::Closed)
             }
             #[cfg(feature = "feeder")]
-            LinkReceiverInner::Feeder(input) => input
-                .rx
-                .get_one()
-                .map_err(|_| {
-                    input.mark_closed();
-                    LinkRecvError::Closed
-                }),
+            LinkReceiverInner::Feeder(input) => input.rx.get_one().map_err(|_| {
+                input.mark_closed();
+                LinkRecvError::Closed
+            }),
         }
     }
 
@@ -1590,9 +1594,10 @@ impl LinkReceiver {
                         if Instant::now() >= deadline {
                             return RecvPoll::Timeout;
                         }
-                        thread::sleep(Duration::from_millis(1).min(
-                            deadline.saturating_duration_since(Instant::now()),
-                        ));
+                        thread::sleep(
+                            Duration::from_millis(1)
+                                .min(deadline.saturating_duration_since(Instant::now())),
+                        );
                     }
                 }
             }
@@ -1650,9 +1655,7 @@ impl Link {
             #[cfg(feature = "feeder")]
             LinkKind::Feeder { feeder, .. } => LinkSender {
                 inner: LinkSenderInner::Feeder(
-                    feeder
-                        .tx()
-                        .expect("feeder producer handle unavailable"),
+                    feeder.tx().expect("feeder producer handle unavailable"),
                 ),
             },
         }
@@ -1665,10 +1668,7 @@ impl Link {
             },
             #[cfg(feature = "feeder")]
             LinkKind::Feeder {
-                feeder,
-                low,
-                high,
-                ..
+                feeder, low, high, ..
             } => LinkReceiver {
                 inner: LinkReceiverInner::Feeder(FeederLinkReceiver::new(
                     Arc::clone(feeder),
@@ -1716,6 +1716,29 @@ impl Link {
 struct LinkStats {
     arrivals: AtomicU64,
     drains: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SingleThreadWeightedBranchConfig {
+    pub target_queue_seconds: f64,
+    pub ewma_half_life: Duration,
+}
+
+impl Default for SingleThreadWeightedBranchConfig {
+    fn default() -> Self {
+        Self {
+            target_queue_seconds: 4.0,
+            ewma_half_life: Duration::from_secs(1),
+        }
+    }
+}
+
+pub struct WeightedBranchLinks<T>
+where
+    T: Send + 'static,
+{
+    pub left: GraphLink<T>,
+    pub right: GraphLink<T>,
 }
 
 pub struct GraphLink<T>
@@ -1838,7 +1861,45 @@ where
             output_acquire_builder: stage.output_acquire_builder,
             anchor: stage.anchor,
             input_link: input.index,
-            output_link: output.index,
+            output_links: vec![output.index],
+            weighted_branch_config: None,
+            external_index: None,
+        });
+    }
+
+    pub fn add_single_thread_weighted_branch<T>(
+        &mut self,
+        input: GraphLink<T>,
+        name: impl Into<String>,
+        config: SingleThreadWeightedBranchConfig,
+    ) -> WeightedBranchLinks<T>
+    where
+        T: Send + 'static,
+    {
+        let left = self.link();
+        let right = self.link();
+        self.add_single_thread_weighted_branch_to(input, name, left, right, config);
+        WeightedBranchLinks { left, right }
+    }
+
+    pub fn add_single_thread_weighted_branch_to<T>(
+        &mut self,
+        input: GraphLink<T>,
+        name: impl Into<String>,
+        left: GraphLink<T>,
+        right: GraphLink<T>,
+        config: SingleThreadWeightedBranchConfig,
+    ) where
+        T: Send + 'static,
+    {
+        self.stages.push(GraphStageSpec {
+            name: name.into(),
+            stage: None,
+            output_acquire_builder: None,
+            anchor: None,
+            input_link: input.index,
+            output_links: vec![left.index, right.index],
+            weighted_branch_config: Some(config),
             external_index: None,
         });
     }
@@ -1878,7 +1939,8 @@ where
             output_acquire_builder: None,
             anchor: None,
             input_link: input.index,
-            output_link: output.index,
+            output_links: vec![output.index],
+            weighted_branch_config: None,
             external_index: Some(token.index),
         });
         token
@@ -1928,7 +1990,8 @@ where
     output_acquire_builder: Option<Arc<dyn OutputAcquireBuilder + Send + Sync>>,
     anchor: Option<AnchorHints>,
     input_link: usize,
-    output_link: usize,
+    output_links: Vec<usize>,
+    weighted_branch_config: Option<SingleThreadWeightedBranchConfig>,
     external_index: Option<usize>,
 }
 
@@ -1942,7 +2005,8 @@ where
     output_acquire: Option<DynAcquire>,
     anchor: Option<ResolvedAnchor>,
     input_link: usize,
-    output_link: usize,
+    output_links: Vec<usize>,
+    weighted_branch_config: Option<SingleThreadWeightedBranchConfig>,
     is_external: bool,
 }
 
@@ -1958,6 +2022,7 @@ where
     E: Debug + Display + Send + 'static,
 {
     Run(WorkerAssignment<E>),
+    RunWeightedBranch(WeightedBranchAssignment),
     Stop,
 }
 
@@ -1979,6 +2044,197 @@ where
     poll_interval: Duration,
     internal_failure: channel::Sender<InternalFailure>,
     stats: Arc<WorkerStats>,
+}
+
+struct WeightedBranchAssignment {
+    stage_index: usize,
+    input: LinkReceiver,
+    input_stats: Arc<LinkStats>,
+    left_output: LinkSender,
+    left_output_stats: Arc<LinkStats>,
+    right_output: LinkSender,
+    right_output_stats: Arc<LinkStats>,
+    left_queue_len: Arc<AtomicUsize>,
+    right_queue_len: Arc<AtomicUsize>,
+    controller: WeightedBranchController,
+    sample_interval: Duration,
+    is_input_stage: bool,
+    retire: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+    abort: Arc<AtomicBool>,
+    poll_interval: Duration,
+    internal_failure: channel::Sender<InternalFailure>,
+    stats: Arc<WorkerStats>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WeightedBranchArmState {
+    last_arrivals: u64,
+    last_drains: u64,
+    drain_rate_ewma: f64,
+    net_rate_ewma: f64,
+    smoothed_len: f64,
+    ready: bool,
+}
+
+impl Default for WeightedBranchArmState {
+    fn default() -> Self {
+        Self {
+            last_arrivals: 0,
+            last_drains: 0,
+            drain_rate_ewma: 0.0,
+            net_rate_ewma: 0.0,
+            smoothed_len: 0.0,
+            ready: false,
+        }
+    }
+}
+
+struct WeightedBranchController {
+    target_queue_seconds: f64,
+    ewma_half_life_secs: f64,
+    left: WeightedBranchArmState,
+    right: WeightedBranchArmState,
+    next_alternate_left: bool,
+}
+
+impl WeightedBranchController {
+    fn new(config: SingleThreadWeightedBranchConfig) -> Self {
+        Self {
+            target_queue_seconds: config.target_queue_seconds,
+            ewma_half_life_secs: config.ewma_half_life.as_secs_f64().max(0.000_001),
+            left: WeightedBranchArmState::default(),
+            right: WeightedBranchArmState::default(),
+            next_alternate_left: true,
+        }
+    }
+
+    fn sample_arms(
+        &mut self,
+        elapsed_secs: f64,
+        left_stats: &LinkStats,
+        right_stats: &LinkStats,
+        left_queue_len: usize,
+        right_queue_len: usize,
+    ) {
+        let alpha = 1.0 - 0.5_f64.powf(elapsed_secs / self.ewma_half_life_secs);
+        Self::sample_arm(
+            &mut self.left,
+            left_stats,
+            left_queue_len,
+            elapsed_secs,
+            alpha,
+        );
+        Self::sample_arm(
+            &mut self.right,
+            right_stats,
+            right_queue_len,
+            elapsed_secs,
+            alpha,
+        );
+    }
+
+    fn sample_arm(
+        arm: &mut WeightedBranchArmState,
+        stats: &LinkStats,
+        queue_len: usize,
+        elapsed_secs: f64,
+        alpha: f64,
+    ) {
+        let arrivals = stats.arrivals.load(Ordering::Relaxed);
+        let drains = stats.drains.load(Ordering::Relaxed);
+        let delta_arrivals = arrivals.saturating_sub(arm.last_arrivals);
+        let delta_drains = drains.saturating_sub(arm.last_drains);
+        arm.last_arrivals = arrivals;
+        arm.last_drains = drains;
+
+        let arrival_rate = delta_arrivals as f64 / elapsed_secs;
+        let drain_rate = delta_drains as f64 / elapsed_secs;
+        let net_rate = arrival_rate - drain_rate;
+
+        arm.drain_rate_ewma = ewma_alpha(arm.drain_rate_ewma, drain_rate, alpha);
+        arm.net_rate_ewma = ewma_alpha(arm.net_rate_ewma, net_rate, alpha);
+        arm.smoothed_len = ewma_alpha(arm.smoothed_len, queue_len as f64, alpha);
+
+        if arm.smoothed_len >= 1.0 || arm.net_rate_ewma > 0.0 {
+            arm.ready = true;
+        }
+    }
+
+    fn arms_ready(&self) -> bool {
+        self.left.ready && self.right.ready
+    }
+
+    fn choose_route(&mut self, left_queue_len: usize, right_queue_len: usize) -> bool {
+        let left_len = left_queue_len.max(self.left.smoothed_len.ceil() as usize);
+        let right_len = right_queue_len.max(self.right.smoothed_len.ceil() as usize);
+        if !self.left.ready || !self.right.ready {
+            let route_left = self.next_alternate_left;
+            self.next_alternate_left = !self.next_alternate_left;
+            return route_left;
+        }
+
+        let left_fill = Self::fill_ratio(
+            left_len,
+            self.left.drain_rate_ewma,
+            self.target_queue_seconds,
+        );
+        let right_fill = Self::fill_ratio(
+            right_len,
+            self.right.drain_rate_ewma,
+            self.target_queue_seconds,
+        );
+
+        if left_fill < right_fill {
+            return true;
+        }
+        if right_fill < left_fill {
+            return false;
+        }
+
+        let route_left = self.next_alternate_left;
+        self.next_alternate_left = !self.next_alternate_left;
+        route_left
+    }
+
+    fn fill_ratio(queue_len: usize, drain_rate_ewma: f64, target_queue_seconds: f64) -> f64 {
+        let virtual_capacity = Self::virtual_capacity(drain_rate_ewma, target_queue_seconds);
+        queue_len as f64 / virtual_capacity.max(1) as f64
+    }
+
+    fn virtual_capacity(drain_rate_ewma: f64, target_queue_seconds: f64) -> usize {
+        (drain_rate_ewma * target_queue_seconds).ceil().max(1.0) as usize
+    }
+}
+
+fn ewma_alpha(previous: f64, sample: f64, alpha: f64) -> f64 {
+    if previous == 0.0 {
+        sample
+    } else {
+        (previous * (1.0 - alpha)) + (sample * alpha)
+    }
+}
+
+fn validate_weighted_branch_config<E>(
+    branch: &str,
+    config: &SingleThreadWeightedBranchConfig,
+) -> Result<(), E>
+where
+    E: Debug + Display + Send + 'static,
+{
+    if config.target_queue_seconds <= 0.0 || !config.target_queue_seconds.is_finite() {
+        return Err(PiperError::InvalidWeightedBranchConfig {
+            branch: branch.to_string(),
+            message: "target_queue_seconds must be positive and finite".to_string(),
+        });
+    }
+    if config.ewma_half_life == Duration::ZERO {
+        return Err(PiperError::InvalidWeightedBranchConfig {
+            branch: branch.to_string(),
+            message: "ewma_half_life must be greater than zero".to_string(),
+        });
+    }
+    Ok(())
 }
 
 enum WorkerEvent<E>
@@ -2052,6 +2308,7 @@ struct PendingScale {
 
 struct StageControl {
     is_external: bool,
+    is_weighted_branch: bool,
     processed_count: u64,
     busy_ratio: f64,
     service_time_ewma: f64,
@@ -2156,6 +2413,7 @@ where
         .iter()
         .map(|stage| StageControl {
             is_external: stage.is_external,
+            is_weighted_branch: stage.weighted_branch_config.is_some(),
             processed_count: 0,
             busy_ratio: 0.0,
             service_time_ewma: 0.0,
@@ -2198,7 +2456,11 @@ where
     let mut adjacency = vec![Vec::<usize>::new(); stages.len()];
     for (producer_index, producer) in stages.iter().enumerate() {
         for (consumer_index, consumer) in stages.iter().enumerate() {
-            if producer.output_link == consumer.input_link {
+            if producer
+                .output_links
+                .iter()
+                .any(|&output| output == consumer.input_link)
+            {
                 adjacency[producer_index].push(consumer_index);
             }
         }
@@ -2283,9 +2545,40 @@ where
         }
 
         for stage in &stages {
-            if stage.input_link >= link_count || stage.output_link >= link_count {
+            if stage.input_link >= link_count {
                 return Err(PiperError::InvalidGraph {
                     message: format!("stage `{}` references a missing link", stage.name),
+                });
+            }
+            for &output_link in &stage.output_links {
+                if output_link >= link_count {
+                    return Err(PiperError::InvalidGraph {
+                        message: format!("stage `{}` references a missing link", stage.name),
+                    });
+                }
+            }
+            if let Some(config) = &stage.weighted_branch_config {
+                validate_weighted_branch_config(&stage.name, config)?;
+                if stage.output_links.len() != 2 {
+                    return Err(PiperError::InvalidGraph {
+                        message: format!(
+                            "weighted branch `{}` must have exactly two output links",
+                            stage.name
+                        ),
+                    });
+                }
+                #[cfg(feature = "feeder")]
+                for (link_index, &output_link) in stage.output_links.iter().enumerate() {
+                    if feeder_links.contains_key(&output_link) {
+                        return Err(PiperError::UnsupportedWeightedBranchFeederOutput {
+                            branch: stage.name.clone(),
+                            link: link_index,
+                        });
+                    }
+                }
+            } else if stage.output_links.len() != 1 {
+                return Err(PiperError::InvalidGraph {
+                    message: format!("stage `{}` must have exactly one output link", stage.name),
                 });
             }
         }
@@ -2354,8 +2647,8 @@ where
                     name: stage.name.clone(),
                     input: links[stage.input_link].make_input(),
                     input_stats: Arc::clone(&links[stage.input_link].stats),
-                    output: links[stage.output_link].make_output(),
-                    output_stats: Arc::clone(&links[stage.output_link].stats),
+                    output: links[stage.output_links[0]].make_output(),
+                    output_stats: Arc::clone(&links[stage.output_links[0]].stats),
                     shutdown: Arc::clone(&shutdown),
                     abort: Arc::clone(&abort),
                     internal_failure: internal_failure_sender.clone(),
@@ -2376,7 +2669,8 @@ where
                         .map(|builder| builder.build(lease_runtime.clone())),
                     anchor,
                     input_link: stage.input_link,
-                    output_link: stage.output_link,
+                    output_links: stage.output_links,
+                    weighted_branch_config: stage.weighted_branch_config,
                     is_external,
                 })
             })
@@ -2404,7 +2698,8 @@ where
                     index,
                     name: stage.name.clone(),
                     input_link: stage.input_link,
-                    output_link: stage.output_link,
+                    output_link: stage.output_links[0],
+                    output_links: stage.output_links.clone(),
                     active_threads: 0,
                     processed_count: 0,
                     busy_ratio: 0.0,
@@ -2583,6 +2878,7 @@ struct ManifestStage {
     name: String,
     input_link: String,
     output_link: String,
+    output_links: Vec<String>,
     is_anchor: bool,
     is_fixed_anchor: bool,
     is_external: bool,
@@ -2671,12 +2967,13 @@ where
             config.path.display()
         ),
     })?;
-    let manifest_json = serde_json::to_string(&manifest).map_err(|source| PiperError::Telemetry {
-        message: format!(
-            "failed to serialize telemetry manifest `{}`: {source}",
-            config.path.display()
-        ),
-    })?;
+    let manifest_json =
+        serde_json::to_string(&manifest).map_err(|source| PiperError::Telemetry {
+            message: format!(
+                "failed to serialize telemetry manifest `{}`: {source}",
+                config.path.display()
+            ),
+        })?;
     writeln!(writer, "{TELEMETRY_MANIFEST_PREFIX}{manifest_json}").map_err(|source| {
         PiperError::Telemetry {
             message: format!(
@@ -2805,14 +3102,8 @@ fn manifest_link_label(
     stages: &[ManifestStage],
 ) -> String {
     match kind {
-        "input" => format!(
-            "input -> {}",
-            format_manifest_node_list(consumers, stages)
-        ),
-        "output" => format!(
-            "{} -> output",
-            format_manifest_node_list(producers, stages)
-        ),
+        "input" => format!("input -> {}", format_manifest_node_list(consumers, stages)),
+        "output" => format!("{} -> output", format_manifest_node_list(producers, stages)),
         "fork" => format!(
             "{} -> {}",
             manifest_stage_name(&producers[0], stages),
@@ -2875,6 +3166,11 @@ fn build_telemetry_manifest(
             name: stage.name.clone(),
             input_link: link_object_id(stage.input_link),
             output_link: link_object_id(stage.output_link),
+            output_links: stage
+                .output_links
+                .iter()
+                .map(|&index| link_object_id(index))
+                .collect(),
             is_anchor: stage.is_anchor,
             is_fixed_anchor: stage.is_fixed_anchor,
             is_external: stage.is_external,
@@ -2884,7 +3180,9 @@ fn build_telemetry_manifest(
     for stage in &snapshot.stages {
         let stage_id = stage_object_id(stage.index);
         consumers_by_link[stage.input_link].push(stage_id.clone());
-        producers_by_link[stage.output_link].push(stage_id);
+        for &output_link in &stage.output_links {
+            producers_by_link[output_link].push(stage_id.clone());
+        }
     }
     producers_by_link[input_link] = vec!["input".to_string()];
     for link_index in 0..link_count {
@@ -2899,7 +3197,7 @@ fn build_telemetry_manifest(
                 .iter()
                 .find(|stage| stage_object_id(stage.index) == *consumer_id)
             {
-                if stage.output_link == output_link {
+                if stage.output_links.iter().any(|&link| link == output_link) {
                     consumers_by_link[link_index] = vec!["output".to_string()];
                 }
             }
@@ -2912,8 +3210,9 @@ fn build_telemetry_manifest(
         .map(|link| {
             let producers = producers_by_link[link.index].clone();
             let consumers = consumers_by_link[link.index].clone();
-            let kind = manifest_link_kind(link.index, input_link, output_link, &producers, &consumers)
-                .to_string();
+            let kind =
+                manifest_link_kind(link.index, input_link, output_link, &producers, &consumers)
+                    .to_string();
             let label = manifest_link_label(&kind, &producers, &consumers, &stages);
             ManifestLink {
                 id: link_object_id(link.index),
@@ -3049,7 +3348,11 @@ fn build_telemetry_manifest(
             ("processed_count", "processed count", None),
             ("busy_ratio", "busy ratio", None),
             ("service_time_ms", "service time", Some("ms")),
-            ("per_worker_throughput", "per-worker throughput", Some("items/s")),
+            (
+                "per_worker_throughput",
+                "per-worker throughput",
+                Some("items/s"),
+            ),
             ("desired_workers", "desired workers", None),
             ("scaling_state", "scaling state", None),
         ] {
@@ -3118,12 +3421,7 @@ fn build_telemetry_manifest(
 
 fn telemetry_log_header(manifest: &TelemetryLogManifest) -> String {
     let mut fields = vec!["elapsed_ms".to_string()];
-    fields.extend(
-        manifest
-            .metrics
-            .iter()
-            .map(|metric| metric.column.clone()),
-    );
+    fields.extend(manifest.metrics.iter().map(|metric| metric.column.clone()));
     fields.join(",")
 }
 
@@ -3141,7 +3439,8 @@ fn telemetry_log_metric_value(column: &str, snapshot: &PiperSnapshot) -> String 
             if let Some(rest) = column.strip_prefix("link") {
                 if let Some((index, metric)) = rest.split_once('_') {
                     if let Ok(link_index) = index.parse::<usize>() {
-                        if let Some(link) = snapshot.links.iter().find(|link| link.index == link_index)
+                        if let Some(link) =
+                            snapshot.links.iter().find(|link| link.index == link_index)
                         {
                             return match metric {
                                 "len" => link.len.to_string(),
@@ -3159,8 +3458,10 @@ fn telemetry_log_metric_value(column: &str, snapshot: &PiperSnapshot) -> String 
             if let Some(rest) = column.strip_prefix("stage") {
                 if let Some((index, metric)) = rest.split_once('_') {
                     if let Ok(stage_index) = index.parse::<usize>() {
-                        if let Some(stage) =
-                            snapshot.stages.iter().find(|stage| stage.index == stage_index)
+                        if let Some(stage) = snapshot
+                            .stages
+                            .iter()
+                            .find(|stage| stage.index == stage_index)
                         {
                             return match metric {
                                 "active_threads" => stage.active_threads.to_string(),
@@ -3250,6 +3551,9 @@ where
     let mut active_by_stage = vec![Vec::<usize>::new(); stages.len()];
     let mut parked = Vec::new();
     let mut link_controls = vec![LinkControl::default(); links.len()];
+    let link_queue_lens: Vec<Arc<AtomicUsize>> = (0..links.len())
+        .map(|_| Arc::new(AtomicUsize::new(0)))
+        .collect();
     let mut controls = build_stage_controls(&stages);
     let global_worker_cap = resolve_global_worker_cap(config.global_worker_cap, stages.len());
     let mut pending_scale = None;
@@ -3260,6 +3564,8 @@ where
     for stage_index in 0..stages.len() {
         let active_count = if stages[stage_index].is_external {
             0
+        } else if stages[stage_index].weighted_branch_config.is_some() {
+            1
         } else if let Some(anchor) = stages[stage_index].anchor {
             if let Some(fixed_threads) = anchor.fixed_threads {
                 fixed_threads
@@ -3287,6 +3593,7 @@ where
                 &shutdown,
                 &abort,
                 &internal_failure_sender,
+                &link_queue_lens,
                 &mut workers,
                 &mut active_by_stage,
             )?;
@@ -3373,6 +3680,9 @@ where
             .max(Duration::from_micros(1));
         last_sample_at = now;
         sample_links(&links, sample_elapsed, &mut link_controls);
+        for (index, link) in links.iter().enumerate() {
+            link_queue_lens[index].store(link.queue_len().unwrap_or(0), Ordering::Relaxed);
+        }
         collect_stage_samples(
             &workers,
             &active_by_stage,
@@ -3417,6 +3727,7 @@ where
                             &shutdown,
                             &abort,
                             &internal_failure_sender,
+                            &link_queue_lens,
                             &mut workers,
                             &mut active_by_stage,
                         )?;
@@ -3570,6 +3881,7 @@ where
         .iter()
         .filter(|stage| {
             !stage.is_external
+                && stage.weighted_branch_config.is_none()
                 && !stage
                     .anchor
                     .is_some_and(|anchor| anchor.fixed_threads.is_some())
@@ -3588,6 +3900,7 @@ fn assign_worker<E>(
     shutdown: &Arc<AtomicBool>,
     abort: &Arc<AtomicBool>,
     internal_failure: &channel::Sender<InternalFailure>,
+    link_queue_lens: &[Arc<AtomicUsize>],
     workers: &mut [WorkerSlot<E>],
     active_by_stage: &mut [Vec<usize>],
 ) -> Result<(), E>
@@ -3597,18 +3910,54 @@ where
     let retire = Arc::new(AtomicBool::new(false));
     workers[worker_id].stats.reset();
     let stage = &stages[stage_index];
+    if let Some(branch_config) = stage.weighted_branch_config {
+        let left_link = stage.output_links[0];
+        let right_link = stage.output_links[1];
+        let assignment = WeightedBranchAssignment {
+            stage_index,
+            input: links[stage.input_link].make_input(),
+            input_stats: Arc::clone(&links[stage.input_link].stats),
+            left_output: links[left_link].make_output(),
+            left_output_stats: Arc::clone(&links[left_link].stats),
+            right_output: links[right_link].make_output(),
+            right_output_stats: Arc::clone(&links[right_link].stats),
+            left_queue_len: Arc::clone(&link_queue_lens[left_link]),
+            right_queue_len: Arc::clone(&link_queue_lens[right_link]),
+            controller: WeightedBranchController::new(branch_config),
+            sample_interval: config.sample_interval,
+            is_input_stage: stage.input_link == input_link,
+            retire: Arc::clone(&retire),
+            shutdown: Arc::clone(shutdown),
+            abort: Arc::clone(abort),
+            poll_interval: config.poll_interval,
+            internal_failure: internal_failure.clone(),
+            stats: Arc::clone(&workers[worker_id].stats),
+        };
+        workers[worker_id].active_stage = Some(stage_index);
+        workers[worker_id].retire = Some(retire);
+        active_by_stage[stage_index].push(worker_id);
+        return workers[worker_id]
+            .command
+            .send(WorkerCommand::RunWeightedBranch(assignment))
+            .map_err(|_| PiperError::Internal {
+                worker: workers[worker_id].name.clone(),
+                message: "worker command channel closed".to_string(),
+            });
+    }
+
     let stage_impl = stage.stage.as_ref().ok_or_else(|| PiperError::Internal {
         worker: workers[worker_id].name.clone(),
         message: "cannot assign a managed worker to an external node".to_string(),
     })?;
-    let output = links[stage.output_link].make_output();
+    let output_link = stage.output_links[0];
+    let output = links[output_link].make_output();
     let assignment = WorkerAssignment {
         stage_index,
         stage: Arc::clone(stage_impl),
         input: links[stage.input_link].make_input(),
         input_stats: Arc::clone(&links[stage.input_link].stats),
         output,
-        output_stats: Arc::clone(&links[stage.output_link].stats),
+        output_stats: Arc::clone(&links[output_link].stats),
         output_acquire: stage.output_acquire.clone(),
         is_input_stage: stage.input_link == input_link,
         retire: Arc::clone(&retire),
@@ -3642,6 +3991,9 @@ fn worker_loop<E>(
         match command {
             WorkerCommand::Run(assignment) => {
                 run_assignment(worker_id, &worker_name, assignment, &event_sender);
+            }
+            WorkerCommand::RunWeightedBranch(assignment) => {
+                run_weighted_branch_assignment(worker_id, &worker_name, assignment, &event_sender);
             }
             WorkerCommand::Stop => break,
         }
@@ -3734,9 +4086,7 @@ fn run_assignment<E>(
                     duration_nanos_u64(wait_started.elapsed()),
                     Ordering::Relaxed,
                 );
-                if assignment.shutdown.load(Ordering::Acquire)
-                    || assignment.input.is_terminated()
-                {
+                if assignment.shutdown.load(Ordering::Acquire) || assignment.input.is_terminated() {
                     break;
                 }
             }
@@ -3759,6 +4109,113 @@ fn run_assignment<E>(
                 failure,
             });
             return;
+        }
+    }
+
+    let _ = event_sender.send(WorkerEvent::Parked {
+        worker_id,
+        stage_index,
+    });
+}
+
+fn run_weighted_branch_assignment<E>(
+    worker_id: usize,
+    _worker_name: &str,
+    mut assignment: WeightedBranchAssignment,
+    event_sender: &channel::Sender<WorkerEvent<E>>,
+) where
+    E: Debug + Display + Send + 'static,
+{
+    let stage_index = assignment.stage_index;
+    let _ = event_sender.send(WorkerEvent::Started { worker_id });
+    let mut last_controller_sample =
+        Instant::now() - assignment.sample_interval - Duration::from_micros(1);
+
+    loop {
+        if assignment.abort.load(Ordering::Acquire) {
+            break;
+        }
+        if assignment.retire.load(Ordering::Acquire) {
+            break;
+        }
+        if assignment.shutdown.load(Ordering::Acquire)
+            && assignment.is_input_stage
+            && assignment.input.is_empty()
+        {
+            break;
+        }
+
+        let wait_started = Instant::now();
+        match assignment.input.recv_poll(assignment.poll_interval) {
+            RecvPoll::Item(message) => {
+                assignment.stats.wait_nanos.fetch_add(
+                    duration_nanos_u64(wait_started.elapsed()),
+                    Ordering::Relaxed,
+                );
+                assignment
+                    .input_stats
+                    .drains
+                    .fetch_add(1, Ordering::Relaxed);
+
+                let now = Instant::now();
+                let elapsed = now.duration_since(last_controller_sample);
+                if !assignment.controller.arms_ready() || elapsed >= assignment.sample_interval {
+                    last_controller_sample = now;
+                    assignment.controller.sample_arms(
+                        elapsed.as_secs_f64().max(0.000_001),
+                        &assignment.left_output_stats,
+                        &assignment.right_output_stats,
+                        assignment.left_queue_len.load(Ordering::Relaxed),
+                        assignment.right_queue_len.load(Ordering::Relaxed),
+                    );
+                }
+
+                let route_left = assignment.controller.choose_route(
+                    assignment.left_queue_len.load(Ordering::Relaxed),
+                    assignment.right_queue_len.load(Ordering::Relaxed),
+                );
+                let (output, output_stats) = if route_left {
+                    (&assignment.left_output, &assignment.left_output_stats)
+                } else {
+                    (&assignment.right_output, &assignment.right_output_stats)
+                };
+
+                match output.send(message) {
+                    Ok(()) => {
+                        output_stats.arrivals.fetch_add(1, Ordering::Relaxed);
+                        assignment
+                            .stats
+                            .processed_items
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_)
+                        if !assignment.shutdown.load(Ordering::Acquire)
+                            && !assignment.abort.load(Ordering::Acquire) =>
+                    {
+                        assignment.abort.store(true, Ordering::Release);
+                        let _ = assignment.internal_failure.send(InternalFailure::internal(
+                            "stage output channel closed unexpectedly",
+                        ));
+                    }
+                    Err(_) => {}
+                }
+            }
+            RecvPoll::Timeout => {
+                assignment.stats.wait_nanos.fetch_add(
+                    duration_nanos_u64(wait_started.elapsed()),
+                    Ordering::Relaxed,
+                );
+                if assignment.shutdown.load(Ordering::Acquire) || assignment.input.is_terminated() {
+                    break;
+                }
+            }
+            RecvPoll::Disconnected => {
+                assignment.stats.wait_nanos.fetch_add(
+                    duration_nanos_u64(wait_started.elapsed()),
+                    Ordering::Relaxed,
+                );
+                break;
+            }
         }
     }
 
@@ -4038,7 +4495,7 @@ fn collect_stage_samples<E>(
         }
 
         let input_link = stages[stage_index].input_link;
-        let output_link = stages[stage_index].output_link;
+        let output_link = stages[stage_index].output_links[0];
 
         if sample.processed_items > 0 || links[input_link].trend != QueueTrend::Starved {
             control.idle_samples = 0;
@@ -4093,6 +4550,10 @@ fn update_desired_workers<E>(
     for stage_index in 0..controls.len() {
         if controls[stage_index].is_external {
             controls[stage_index].desired_workers = 0;
+            continue;
+        }
+        if controls[stage_index].is_weighted_branch {
+            controls[stage_index].desired_workers = 1;
             continue;
         }
         let active = active_by_stage[stage_index].len().max(1);
@@ -4206,7 +4667,7 @@ where
         }
 
         let input_link = stages[anchor_index].input_link;
-        let stage_output_link = stages[anchor_index].output_link;
+        let stage_output_link = stages[anchor_index].output_links[0];
         let output_backpressure = links[output_link].trend.is_growing();
         let input_underfed =
             link_underfeeds_stage(&links[input_link], active_by_stage[anchor_index].len());
@@ -4407,7 +4868,7 @@ where
 
     let has_budget = active_worker_count(active_by_stage) < global_worker_cap;
     let input_link = stages[anchor_index].input_link;
-    let stage_output_link = stages[anchor_index].output_link;
+    let stage_output_link = stages[anchor_index].output_links[0];
     let input_ready = !link_underfeeds_stage(&links[input_link], active);
     let downstream_ready =
         !links[stage_output_link].trend.is_growing() && !links[output_link].trend.is_growing();
@@ -4479,6 +4940,7 @@ fn link_underfeeds_stage(link: &LinkControl, active_threads: usize) -> bool {
 
 fn stage_can_scale(control: &StageControl) -> bool {
     !control.is_external
+        && !control.is_weighted_branch
         && !control
             .anchor
             .as_ref()
@@ -4562,10 +5024,13 @@ fn producer_stages<E>(
 where
     E: Debug + Display + Send + 'static,
 {
-    stages
-        .iter()
-        .enumerate()
-        .filter_map(move |(index, stage)| (stage.output_link == link_index).then_some(index))
+    stages.iter().enumerate().filter_map(move |(index, stage)| {
+        stage
+            .output_links
+            .iter()
+            .any(|&output| output == link_index)
+            .then_some(index)
+    })
 }
 
 fn set_anchor_reason(
@@ -4634,39 +5099,52 @@ fn update_snapshot<E>(
     snapshot.stages = stages
         .iter()
         .enumerate()
-        .map(|(index, stage)| StageSnapshot {
-            index,
-            name: stage.name.clone(),
-            input_link: stage.input_link,
-            output_link: stage.output_link,
-            active_threads: active_by_stage[index].len(),
-            processed_count: controls[index].processed_count,
-            busy_ratio: controls[index].busy_ratio,
-            service_time: Duration::from_nanos(
-                controls[index]
-                    .service_time_ewma
-                    .max(0.0)
-                    .min(u64::MAX as f64) as u64,
-            ),
-            per_worker_throughput: controls[index].per_worker_throughput,
-            desired_workers: controls[index].desired_workers,
-            scaling_state: controls[index].scaling_state,
-            is_anchor: controls[index].anchor.is_some(),
-            is_fixed_anchor: controls[index]
-                .anchor
-                .as_ref()
-                .is_some_and(|anchor| anchor.fixed_threads.is_some()),
-            is_external: stage.is_external,
-            external_input_rate: if stage.is_external {
-                link_controls[stage.input_link].drain_rate
+        .map(|(index, stage)| {
+            let desired_workers = if controls[index].is_weighted_branch {
+                1
             } else {
-                0.0
-            },
-            external_output_rate: if stage.is_external {
-                link_controls[stage.output_link].arrival_rate
+                controls[index].desired_workers
+            };
+            let active_threads = if controls[index].is_weighted_branch {
+                active_by_stage[index].len().max(1)
             } else {
-                0.0
-            },
+                active_by_stage[index].len()
+            };
+            StageSnapshot {
+                index,
+                name: stage.name.clone(),
+                input_link: stage.input_link,
+                output_link: stage.output_links[0],
+                output_links: stage.output_links.clone(),
+                active_threads,
+                processed_count: controls[index].processed_count,
+                busy_ratio: controls[index].busy_ratio,
+                service_time: Duration::from_nanos(
+                    controls[index]
+                        .service_time_ewma
+                        .max(0.0)
+                        .min(u64::MAX as f64) as u64,
+                ),
+                per_worker_throughput: controls[index].per_worker_throughput,
+                desired_workers,
+                scaling_state: controls[index].scaling_state,
+                is_anchor: controls[index].anchor.is_some(),
+                is_fixed_anchor: controls[index]
+                    .anchor
+                    .as_ref()
+                    .is_some_and(|anchor| anchor.fixed_threads.is_some()),
+                is_external: stage.is_external,
+                external_input_rate: if stage.is_external {
+                    link_controls[stage.input_link].drain_rate
+                } else {
+                    0.0
+                },
+                external_output_rate: if stage.is_external {
+                    link_controls[stage.output_links[0]].arrival_rate
+                } else {
+                    0.0
+                },
+            }
         })
         .collect();
     snapshot.anchors = controls
@@ -4750,6 +5228,7 @@ mod tests {
     fn support_control() -> StageControl {
         StageControl {
             is_external: false,
+            is_weighted_branch: false,
             processed_count: 0,
             busy_ratio: 0.0,
             service_time_ewma: 1_000_000.0,
@@ -4809,7 +5288,8 @@ mod tests {
                 output_acquire: None,
                 anchor: None,
                 input_link: index,
-                output_link: index + 1,
+                output_links: vec![index + 1],
+                weighted_branch_config: None,
                 is_external: false,
             })
             .collect()
@@ -4833,6 +5313,72 @@ mod tests {
             classify_queue_trend(2, 20, 10.0, 100.0, -90.0),
             QueueTrend::FastDraining
         );
+    }
+
+    fn branch_controller(config: SingleThreadWeightedBranchConfig) -> WeightedBranchController {
+        WeightedBranchController::new(config)
+    }
+
+    fn default_branch_config() -> SingleThreadWeightedBranchConfig {
+        SingleThreadWeightedBranchConfig::default()
+    }
+
+    #[test]
+    fn weighted_branch_warmup_alternates_left_and_right() {
+        let mut controller = branch_controller(default_branch_config());
+        assert!(controller.choose_route(0, 0));
+        assert!(!controller.choose_route(0, 0));
+        assert!(controller.choose_route(0, 0));
+    }
+
+    #[test]
+    fn weighted_branch_one_ready_arm_stays_in_warmup() {
+        let mut controller = branch_controller(default_branch_config());
+        controller.left.ready = true;
+        assert!(controller.choose_route(0, 0));
+        assert!(!controller.choose_route(0, 0));
+    }
+
+    #[test]
+    fn weighted_branch_both_ready_uses_fill_ratio() {
+        let mut controller = branch_controller(default_branch_config());
+        controller.left.ready = true;
+        controller.right.ready = true;
+        controller.left.drain_rate_ewma = 10.0;
+        controller.right.drain_rate_ewma = 1.0;
+        assert!(controller.choose_route(0, 10));
+        assert!(!controller.choose_route(10, 0));
+    }
+
+    #[test]
+    fn weighted_branch_higher_drain_rate_ewma_increases_virtual_capacity() {
+        let config = default_branch_config();
+        let low = WeightedBranchController::virtual_capacity(1.0, config.target_queue_seconds);
+        let high = WeightedBranchController::virtual_capacity(10.0, config.target_queue_seconds);
+        assert!(high > low);
+    }
+
+    #[test]
+    fn weighted_branch_lower_fill_ratio_is_chosen() {
+        let mut controller = branch_controller(default_branch_config());
+        controller.left.ready = true;
+        controller.right.ready = true;
+        controller.left.drain_rate_ewma = 10.0;
+        controller.right.drain_rate_ewma = 10.0;
+        assert!(controller.choose_route(1, 8));
+        assert!(!controller.choose_route(8, 1));
+    }
+
+    #[test]
+    fn weighted_branch_drain_rate_ewma_affects_later_routing() {
+        let mut controller = branch_controller(default_branch_config());
+        controller.left.ready = true;
+        controller.right.ready = true;
+        controller.left.drain_rate_ewma = 10.0;
+        controller.right.drain_rate_ewma = 10.0;
+        assert!(!controller.choose_route(8, 1));
+        controller.left.drain_rate_ewma = 100.0;
+        assert!(controller.choose_route(8, 1));
     }
 
     #[test]
