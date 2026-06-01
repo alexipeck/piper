@@ -2166,8 +2166,8 @@ impl WeightedBranchController {
     }
 
     fn choose_route(&mut self, left_queue_len: usize, right_queue_len: usize) -> bool {
-        let left_len = left_queue_len.max(self.left.smoothed_len.ceil() as usize);
-        let right_len = right_queue_len.max(self.right.smoothed_len.ceil() as usize);
+        let left_len = Self::effective_queue_len(left_queue_len, self.left.smoothed_len);
+        let right_len = Self::effective_queue_len(right_queue_len, self.right.smoothed_len);
         if !self.left.ready || !self.right.ready {
             let route_left = self.next_alternate_left;
             self.next_alternate_left = !self.next_alternate_left;
@@ -2195,6 +2195,20 @@ impl WeightedBranchController {
         let route_left = self.next_alternate_left;
         self.next_alternate_left = !self.next_alternate_left;
         route_left
+    }
+
+    fn effective_queue_len(observed_len: usize, smoothed_len: f64) -> usize {
+        if observed_len == 0 {
+            return 0;
+        }
+
+        let smoothed_len = if smoothed_len.is_finite() && smoothed_len > 0.0 {
+            smoothed_len.ceil() as usize
+        } else {
+            0
+        };
+
+        observed_len.max(smoothed_len)
     }
 
     fn fill_ratio(queue_len: usize, drain_rate_ewma: f64, target_queue_seconds: f64) -> f64 {
@@ -5348,6 +5362,33 @@ mod tests {
         controller.right.drain_rate_ewma = 1.0;
         assert!(controller.choose_route(0, 10));
         assert!(!controller.choose_route(10, 0));
+    }
+
+    #[test]
+    fn weighted_branch_empty_observed_queue_ignores_stale_smoothed_len() {
+        let mut controller = branch_controller(default_branch_config());
+        controller.left.ready = true;
+        controller.right.ready = true;
+        controller.left.drain_rate_ewma = 10.0;
+        controller.right.drain_rate_ewma = 10.0;
+        controller.left.smoothed_len = 0.0;
+        controller.right.smoothed_len = 10.0;
+        controller.next_alternate_left = false;
+
+        assert!(!controller.choose_route(0, 0));
+    }
+
+    #[test]
+    fn weighted_branch_nonempty_observed_queue_keeps_smoothed_backlog_penalty() {
+        let mut controller = branch_controller(default_branch_config());
+        controller.left.ready = true;
+        controller.right.ready = true;
+        controller.left.drain_rate_ewma = 10.0;
+        controller.right.drain_rate_ewma = 10.0;
+        controller.left.smoothed_len = 0.0;
+        controller.right.smoothed_len = 10.0;
+
+        assert!(controller.choose_route(0, 1));
     }
 
     #[test]
